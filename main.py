@@ -39,8 +39,8 @@ JOIN_DELAY_SECONDS = 5 * 60
 DELETE_DAILY_SECONDS = 17
 
 # ===== Pinned message loop =====
-PIN_EVERY_SECONDS = 10 * 60 * 60   # 10 uur
-DELETE_PIN_SECONDS = 15            # verwijder pin bericht na 15 sec
+PIN_EVERY_SECONDS = 20   # 10 uur
+DELETE_PIN_SECONDS = 0            # verwijder pin bericht na 15 sec
 PIN_TEXT = "(15 seconds)"
 
 # ===== DB retention for tracked messages =====
