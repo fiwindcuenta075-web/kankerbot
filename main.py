@@ -88,7 +88,6 @@ async def log_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     try:
         j = update.to_dict()
-        # message / channel_post zijn de meest voorkomende
         chat = (j.get("message", {}) or {}).get("chat", {}) or (j.get("channel_post", {}) or {}).get("chat", {})
         chat_id = chat.get("id")
         title = chat.get("title")
@@ -120,7 +119,7 @@ def current_cycle_date(now: datetime) -> date:
 async def db_init():
     global DB_POOL
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je BOT service variables.")
+        raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je service environment variables.")
 
     DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
@@ -146,6 +145,7 @@ async def db_init():
     logging.info("DB initialized ok")
 
 async def db_track_chat_message_id(message_id: int):
+    """Track elk message_id zodat we later kunnen deleten."""
     global TRACK_PRUNE_COUNTER
     if not message_id:
         return
@@ -283,6 +283,7 @@ async def send_text(bot, chat_id, text):
 async def send_photo(bot, chat_id, photo_path, caption, reply_markup):
     if chat_id is None:
         return None
+
     try:
         with open(photo_path, "rb") as f:
             data = f.read()
@@ -299,4 +300,213 @@ async def send_photo(bot, chat_id, photo_path, caption, reply_markup):
         bio.name = os.path.basename(photo_path)
         bio.seek(0)
         return await bot.send_photo(
-            cha
+            chat_id=chat_id,
+            photo=bio,
+            caption=caption,
+            reply_markup=reply_markup,
+            has_spoiler=True,
+        )
+
+    msg = await safe_send(_do_send, "send_photo(main)")
+    if msg:
+        await db_track_chat_message_id(msg.message_id)
+    return msg
+
+# ================== LOOPS ==================
+async def reset_loop():
+    while True:
+        now = datetime.now(TZ)
+        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
+        if now >= target:
+            target = target + timedelta(days=1)
+
+        await asyncio.sleep(max(1, int((target - now).total_seconds())))
+        logging.info("Cycle boundary reached at 05:00")
+
+async def daily_post_loop(app: Application):
+    last_msg_id = None
+    while True:
+        msg = await send_photo(app.bot, CHAT_ID, PHOTO_PATH, WELCOME_TEXT, build_keyboard())
+
+        if last_msg_id:
+            safe_create_task(
+                delete_later(app.bot, CHAT_ID, last_msg_id, DELETE_DAILY_SECONDS),
+                "delete_old_daily"
+            )
+
+        if msg:
+            last_msg_id = msg.message_id
+
+        await asyncio.sleep(DAILY_SECONDS)
+
+async def pinned_post_loop(app: Application):
+    while True:
+        msg = await send_text(app.bot, CHAT_ID, PIN_TEXT)
+
+        if msg:
+            await safe_send(
+                lambda: app.bot.pin_chat_message(chat_id=CHAT_ID, message_id=msg.message_id),
+                "pin_chat_message(pinned_loop)"
+            )
+            safe_create_task(
+                delete_later(app.bot, CHAT_ID, msg.message_id, DELETE_PIN_SECONDS),
+                "delete_pinned_after_15s"
+            )
+
+        await asyncio.sleep(PIN_EVERY_SECONDS)
+
+async def purge_all_messages_at_5_loop(app: Application):
+    """
+    ✅ Elke dag om 05:00: probeer ALLE getrackte message_ids te verwijderen.
+    Let op: alleen voor messages die de bot gezien/getrackt heeft.
+    """
+    while True:
+        now = datetime.now(TZ)
+        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
+        if now >= target:
+            target = target + timedelta(days=1)
+
+        await asyncio.sleep(max(1, int((target - now).total_seconds())))
+
+        if CHAT_ID is None:
+            logging.warning("05:00 purge skipped (CHAT_ID is None / debug mode).")
+            continue
+
+        async with DB_POOL.acquire() as conn:
+            rows = await conn.fetch("SELECT message_id FROM chat_messages ORDER BY created_at ASC;")
+
+        ids = [int(r["message_id"]) for r in rows]
+        logging.info("05:00 purge starting. tracked_ids=%d", len(ids))
+
+        kept = []
+        for mid in ids:
+            ok = await safe_send(
+                lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=mid),
+                "purge_delete_message"
+            )
+            if ok is None:
+                kept.append(mid)
+
+        async with DB_POOL.acquire() as conn:
+            await conn.execute("TRUNCATE TABLE chat_messages;")
+            if kept:
+                await conn.executemany(
+                    "INSERT INTO chat_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
+                    [(m,) for m in kept]
+                )
+
+        logging.info("05:00 purge done. kept=%d", len(kept))
+
+# ================== HANDLERS ==================
+async def on_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+
+    user = update.effective_user
+    name = (user.full_name if user else "") or "User"
+
+    await q.answer("Verified ✅", show_alert=True)
+    await send_text(context.bot, CHAT_ID, verified_text(name))
+
+async def announce_join_after_delay(context: ContextTypes.DEFAULT_TYPE, name: str):
+    await asyncio.sleep(JOIN_DELAY_SECONDS)
+    name = (name or "").strip()
+    if not name:
+        return
+
+    if await db_is_used(name):
+        return
+
+    await send_text(context.bot, CHAT_ID, f"{name} joined ✅")
+    await db_mark_used(name)
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.new_chat_members:
+        return
+
+    if CHAT_ID is not None:
+        if not update.effective_chat or update.effective_chat.id != CHAT_ID:
+            return
+
+    await db_track_chat_message_id(update.message.message_id)
+
+    for member in update.message.new_chat_members:
+        name = (member.full_name or "").strip()
+        if name:
+            safe_create_task(
+                announce_join_after_delay(context, name),
+                f"announce_join_after_delay({name})"
+            )
+
+    if ENABLE_VERIFY:
+        await send_photo(context.bot, CHAT_ID, PHOTO_PATH, WELCOME_TEXT, build_keyboard())
+
+async def on_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Track ALLE binnenkomende messages.
+    In debug mode (CHAT_ID=None) trackt hij alles, maar dat is tijdelijk.
+    """
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+
+    if CHAT_ID is not None and chat.id != CHAT_ID:
+        return
+
+    await db_track_chat_message_id(msg.message_id)
+
+# ================== INIT ==================
+async def post_init(app: Application):
+    me = await app.bot.get_me()
+    logging.info("Bot started: @%s", me.username)
+
+    await db_init()
+
+    if CHAT_ID is None:
+        logging.warning("CHAT_ID is None -> debug mode. Stuur een bericht in de groep en lees chat_id uit DEBUG_UPDATE logs.")
+    else:
+        ok = await safe_send(
+            lambda: app.bot.send_message(chat_id=CHAT_ID, text="✅ bot gestart (startup test)"),
+            "startup_test"
+        )
+        if ok is None:
+            logging.error("Startup test failed - check CHAT_ID, bot rights, Telegram connectivity.")
+
+    safe_create_task(reset_loop(), "reset_loop")
+
+    if ENABLE_DAILY:
+        safe_create_task(daily_post_loop(app), "daily_post_loop")
+    else:
+        logging.info("ENABLE_DAILY=0 -> daily disabled")
+
+    if ENABLE_PIN:
+        safe_create_task(pinned_post_loop(app), "pinned_post_loop")
+    else:
+        logging.info("ENABLE_PIN=0 -> pinned loop disabled")
+
+    if ENABLE_PURGE_AT_5:
+        safe_create_task(purge_all_messages_at_5_loop(app), "purge_all_messages_at_5_loop")
+    else:
+        logging.info("ENABLE_PURGE_AT_5=0 -> purge disabled")
+
+def main():
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN ontbreekt. Zet BOT_TOKEN in je environment variables.")
+
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+
+    # ✅ Debug logger (altijd)
+    app.add_handler(MessageHandler(filters.ALL, log_updates), group=-1)
+
+    # Track alles
+    app.add_handler(MessageHandler(filters.ALL, on_any_message), group=0)
+
+    app.add_handler(CallbackQueryHandler(on_verify, pattern="^verify$"))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
