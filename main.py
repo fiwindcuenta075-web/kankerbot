@@ -8,7 +8,7 @@ import urllib.parse
 from datetime import datetime, time, timedelta, date
 from zoneinfo import ZoneInfo
 from io import BytesIO
-from typing import Optional
+from typing import Optional, List, Dict
 
 import asyncpg
 
@@ -60,22 +60,19 @@ ENABLE_CLEANUP = os.getenv("ENABLE_CLEANUP", "1") == "1"
 
 # ===== pinned caption loop =====
 ENABLE_PINNED_TEXT = os.getenv("ENABLE_PINNED_TEXT", "1") == "1"
-PINNED_TEXT_SECONDS = int(os.getenv("PINNED_TEXT_SECONDS", "5 * 60"))  # test. normaal: 10*60*60 of 24*60*60
+PINNED_TEXT_SECONDS = int(os.getenv("PINNED_TEXT_SECONDS", "20"))  # test. normaal: 10*60*60 of 24*60*60
 PINNED_BANNER_PATH = os.getenv("PINNED_BANNER_PATH", "IMG_1211.jpg")
-
-# ===== debug update logging + /chatid anywhere =====
-ENABLE_DEBUG_UPDATES = os.getenv("ENABLE_DEBUG_UPDATES", "0") == "1"
 
 # ===== Telegram circuit breaker =====
 TELEGRAM_PAUSE_UNTIL = 0.0  # epoch seconds
 
 # ===== Throttle log spam for "paused" =====
-_LAST_PAUSE_LOG_AT: dict[str, float] = {}
+_LAST_PAUSE_LOG_AT: Dict[str, float] = {}
 _PAUSE_LOG_COOLDOWN = 15.0  # seconds per "what"
 
 # ================== DB GLOBALS ==================
-DB_POOL: asyncpg.Pool | None = None
-JOINED_NAMES: list[str] = []
+DB_POOL: Optional[asyncpg.Pool] = None
+JOINED_NAMES: List[str] = []
 
 # ================== CONTENT ==================
 WELCOME_TEXT = (
@@ -110,7 +107,6 @@ SHARE_TEXT = (
     "https://t.me/pareltjesGW\n\n"
 )
 
-# ✅ Deel-link voor pinned "📤 Delen"
 SHARE_URL_PINNED = (
     "https://t.me/share/url?"
     + "url=" + urllib.parse.quote(GROUP_LINK)
@@ -161,9 +157,8 @@ def current_cycle_date(now: datetime) -> date:
 async def db_init():
     global DB_POOL
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je BOT service variables.")
+        raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je Railway Variables.")
 
-    # ✅ Railway Postgres vereist soms SSL. We proberen eerst ssl=require en vallen terug.
     try:
         DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, ssl="require")
     except Exception:
@@ -186,7 +181,6 @@ async def db_init():
         );
         """)
 
-        # track ALL bot messages
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS bot_messages (
             message_id BIGINT PRIMARY KEY,
@@ -271,13 +265,11 @@ async def db_track_bot_message_id(message_id: int):
                 if BOT_ALLMSG_PRUNE_COUNTER % BOT_MSG_PRUNE_EVERY != 0:
                     return
 
-                # retention
                 await conn.execute(
                     f"DELETE FROM bot_messages "
                     f"WHERE created_at < NOW() - INTERVAL '{BOT_MSG_RETENTION_DAYS} days';"
                 )
 
-                # cap rows
                 await conn.execute(
                     """
                     DELETE FROM bot_messages
@@ -423,6 +415,55 @@ async def send_photo(
     return msg
 
 
+# ================== HANDLERS ==================
+async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer(
+        "Can’t acces the group, because unfortunately you haven’t shared the group 3 times yet.",
+        show_alert=True
+    )
+
+
+# ✅ NEW: delete the "pinned a photo" service message immediately
+async def on_pinned_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.id != CHAT_ID:
+        return
+    if not update.message:
+        return
+
+    # This message itself is the service message ("pinned a ...")
+    service_mid = update.message.message_id
+    await safe_send(
+        lambda: context.bot.delete_message(chat_id=CHAT_ID, message_id=service_mid),
+        "delete_message(pinned_service)"
+    )
+
+
+async def announce_join_after_delay(context: ContextTypes.DEFAULT_TYPE, name: str):
+    await asyncio.sleep(JOIN_DELAY_SECONDS)
+    name = (name or "").strip()
+    if not name:
+        return
+
+    if await db_is_used(name):
+        return
+
+    await send_text(context.bot, CHAT_ID, unlocked_text(name))
+    await db_mark_used(name)
+
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.new_chat_members:
+        return
+    if not update.effective_chat or update.effective_chat.id != CHAT_ID:
+        return
+
+    for member in update.message.new_chat_members:
+        name = (member.full_name or "").strip()
+        if name:
+            await db_remember_joined_name(name)
+            safe_create_task(announce_join_after_delay(context, name), f"announce_join_after_delay({name})")
+
+
 # ================== LOOPS ==================
 async def reset_loop():
     while True:
@@ -455,6 +496,7 @@ async def cleanup_all_bot_messages_loop(app: Application):
                 lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=mid),
                 "delete_message(cleanup_all)"
             )
+            # _DELETE_SKIPPED_OK counts as success, so don't keep it
             if ok is None:
                 kept.append(mid)
 
@@ -518,7 +560,7 @@ async def daily_post_loop(app: Application):
 
         if msg:
             last_msg_id = msg.message_id
-            await safe_send(lambda: app.bot.pin_chat_message(chat_id=CHAT_ID, message_id=msg.message_id), "pin_chat_message")
+            # ✅ IMPORTANT: daily is NOT pinned anymore (only Pareltjes pinned)
 
         await asyncio.sleep(DAILY_SECONDS)
 
@@ -609,40 +651,6 @@ async def activity_loop(app: Application):
         await asyncio.sleep(ACTIVITY_SECONDS)
 
 
-# ================== HANDLERS ==================
-async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer(
-        "Can’t acces the group, because unfortunately you haven’t shared the group 3 times yet.",
-        show_alert=True
-    )
-
-
-async def announce_join_after_delay(context: ContextTypes.DEFAULT_TYPE, name: str):
-    await asyncio.sleep(JOIN_DELAY_SECONDS)
-    name = (name or "").strip()
-    if not name:
-        return
-
-    if await db_is_used(name):
-        return
-
-    await send_text(context.bot, CHAT_ID, unlocked_text(name))
-    await db_mark_used(name)
-
-
-async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.new_chat_members:
-        return
-    if not update.effective_chat or update.effective_chat.id != CHAT_ID:
-        return
-
-    for member in update.message.new_chat_members:
-        name = (member.full_name or "").strip()
-        if name:
-            await db_remember_joined_name(name)
-            safe_create_task(announce_join_after_delay(context, name), f"announce_join_after_delay({name})")
-
-
 # ================== INIT ==================
 async def post_init(app: Application):
     me = await app.bot.get_me()
@@ -690,6 +698,9 @@ def main():
 
     app.add_handler(CallbackQueryHandler(on_open_group, pattern="^open_group$"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+
+    # ✅ delete "pinned a photo" service messages
+    app.add_handler(MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, on_pinned_service_message))
 
     app.run_polling(drop_pending_updates=True)
 
