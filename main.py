@@ -60,7 +60,7 @@ ENABLE_CLEANUP = os.getenv("ENABLE_CLEANUP", "1") == "1"
 
 # ===== pinned caption loop =====
 ENABLE_PINNED_TEXT = os.getenv("ENABLE_PINNED_TEXT", "1") == "1"
-PINNED_TEXT_SECONDS = int(os.getenv("PINNED_TEXT_SECONDS", "20"))  # test. normaal: 10*60*60 of 24*60*60
+PINNED_TEXT_SECONDS = int(os.getenv("PINNED_TEXT_SECONDS", "100"))  # test. normaal: 10*60*60 of 24*60*60
 PINNED_BANNER_PATH = os.getenv("PINNED_BANNER_PATH", "IMG_1211.jpg")
 
 # ===== Telegram circuit breaker =====
