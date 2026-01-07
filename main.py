@@ -1,14 +1,3 @@
-import os
-import asyncio
-import random
-import logging
-import string
-import time as _time
-import urllib.parse
-from datetime import datetime, time, timedelta, date
-from zoneinfo import ZoneInfo
-from io import BytesIO
-from typing import Optional, List, Dict
 
 import asyncpg
 
@@ -75,8 +64,6 @@ SHARE_TEXT = (
     "✨ Pareltjes – Community & Handel ✨\n\n"
     "Gateway (link): 🔥\n"
     "https://t.me/pareltjesGW\n\n"
-    "Groep (link): 👻🔞\n"
-    "https://t.me/+D8FCvP2JTYVlZTZk\n\n"
 )
 
 # Deel-link (Telegram share)
