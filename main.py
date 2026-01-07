@@ -1,5 +1,166 @@
 --- a/bot.py
 +++ b/bot.py
+@@ -84,6 +84,10 @@
+ BOT_MSG_PRUNE_EVERY = 200
+ BOT_MSG_PRUNE_COUNTER = 0
+ 
++# ✅ extra counter voor algemene bot-berichten tabel
++BOT_ALLMSG_PRUNE_COUNTER = 0
++
+ # ===== ENABLE FLAGS via Railway Variables =====
+ ENABLE_DAILY = os.getenv("ENABLE_DAILY", "1") == "1"
+ ENABLE_VERIFY = os.getenv("ENABLE_VERIFY", "1") == "1"
+@@ -140,6 +144,7 @@
+ async def db_init():
+     global DB_POOL
+     if not DATABASE_URL:
+         raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je BOT service variables.")
+@@ -175,6 +180,21 @@
+         CREATE INDEX IF NOT EXISTS idx_bot_verify_messages_created_at
+         ON bot_verify_messages(created_at);
+         """)
+ 
++        # ✅ Nieuw: log alle bot-bericht IDs zodat we ze om 05:00 kunnen verwijderen
++        await conn.execute("""
++        CREATE TABLE IF NOT EXISTS bot_messages (
++            message_id BIGINT PRIMARY KEY,
++            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
++        );
++        """)
++
++        await conn.execute("""
++        CREATE INDEX IF NOT EXISTS idx_bot_messages_created_at
++        ON bot_messages(created_at);
++        """)
++
+     logging.info("DB initialized ok")
+ 
+@@ -235,6 +255,52 @@
+ async def db_track_bot_verify_message_id(message_id: int):
+     global BOT_MSG_PRUNE_COUNTER
+ 
+@@ -302,6 +368,60 @@
+             await asyncio.sleep(1 + attempt)
+ 
++async def db_track_bot_message_id(message_id: int):
++    """
++    ✅ Track ALLE bot-berichten (text/photo etc) voor daily cleanup om 05:00.
++    Zelfde retention/cap mechanisme als verify logging.
++    """
++    global BOT_ALLMSG_PRUNE_COUNTER
++
++    for attempt in range(3):
++        try:
++            async with DB_POOL.acquire() as conn:
++                await conn.execute(
++                    "INSERT INTO bot_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
++                    int(message_id)
++                )
++
++                BOT_ALLMSG_PRUNE_COUNTER += 1
++                if BOT_ALLMSG_PRUNE_COUNTER % BOT_MSG_PRUNE_EVERY != 0:
++                    return
++
++                # retention
++                await conn.execute(
++                    f"DELETE FROM bot_messages "
++                    f"WHERE created_at < NOW() - INTERVAL '{BOT_MSG_RETENTION_DAYS} days';"
++                )
++
++                # cap rows
++                await conn.execute(
++                    """
++                    DELETE FROM bot_messages
++                    WHERE message_id IN (
++                        SELECT message_id
++                        FROM bot_messages
++                        ORDER BY created_at DESC
++                        OFFSET $1
++                    );
++                    """,
++                    BOT_MSG_MAX_ROWS
++                )
++            return
++        except Exception:
++            logging.exception("DB track bot message failed attempt=%s", attempt + 1)
++            await asyncio.sleep(1 + attempt)
++
+@@ -216,6 +327,7 @@
+ async def send_text(bot, chat_id, thread_id, text):
+@@ -241,6 +353,10 @@
+     if msg and thread_id == VERIFY_THREAD_ID:
+         await db_track_bot_verify_message_id(msg.message_id)
+ 
++    # ✅ altijd tracken voor 05:00 cleanup
++    if msg:
++        await db_track_bot_message_id(msg.message_id)
++
+     return msg
+ 
+@@ -288,6 +404,10 @@
+     if msg and thread_id == VERIFY_THREAD_ID:
+         await db_track_bot_verify_message_id(msg.message_id)
+ 
++    # ✅ altijd tracken voor 05:00 cleanup
++    if msg:
++        await db_track_bot_message_id(msg.message_id)
++
+     return msg
+ 
+@@ -310,6 +430,64 @@
+ async def cleanup_verify_topic_loop(app: Application):
+     while True:
+@@ -363,6 +541,79 @@
+         logging.info("Cleanup verify-topic bot messages at 05:00 done. kept=%d", len(kept))
+ 
++async def cleanup_all_bot_messages_loop(app: Application):
++    """
++    ✅ Nieuw: verwijder alle door de bot verstuurde berichten (die we tracken in bot_messages)
++    elke dag om 05:00 Amsterdam.
++    """
++    while True:
++        now = datetime.now(TZ)
++        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
++        if now >= target:
++            target = target + timedelta(days=1)
++
++        await asyncio.sleep(max(1, int((target - now).total_seconds())))
++
++        async with DB_POOL.acquire() as conn:
++            rows = await conn.fetch("SELECT message_id FROM bot_messages;")
++
++        ids = [int(r["message_id"]) for r in rows]
++        kept = []
++
++        for mid in ids:
++            ok = await safe_send(
++                lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=mid),
++                "cleanup_delete_message(all)"
++            )
++            # delete_message returns True on success; None on failure/skip
++            if ok is None:
++                kept.append(mid)
++
++        async with DB_POOL.acquire() as conn:
++            await conn.execute("TRUNCATE TABLE bot_messages;")
++            if kept:
++                await conn.executemany(
++                    "INSERT INTO bot_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
++                    [(m,) for m in kept]
++                )
++
++        logging.info("Cleanup ALL bot messages at 05:00 done. kept=%d", len(kept))
++
+@@ -466,6 +717,11 @@
+     if ENABLE_CLEANUP:
+         safe_create_task(cleanup_verify_topic_loop(app), "cleanup_verify_topic_loop")
++        # ✅ Nieuw: daily cleanup van alle bot-berichten om 05:00
++        safe_create_task(cleanup_all_bot_messages_loop(app), "cleanup_all_bot_messages_loop")
+     else:
+         logging.info("ENABLE_CLEANUP=0 -> cleanup disabled")
+
+--- a/bot.py
++++ b/bot.py
 @@ -1,6 +1,6 @@
  import os
  import asyncio
