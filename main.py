@@ -273,44 +273,6 @@ async def db_mark_used(name: str):
             await asyncio.sleep(1 + attempt)
 
 
-async def db_track_bot_verify_message_id(message_id: int):
-    global BOT_MSG_PRUNE_COUNTER
-
-    for attempt in range(3):
-        try:
-            async with DB_POOL.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO bot_verify_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
-                    int(message_id)
-                )
-
-                BOT_MSG_PRUNE_COUNTER += 1
-                if BOT_MSG_PRUNE_COUNTER % BOT_MSG_PRUNE_EVERY != 0:
-                    return
-
-                await conn.execute(
-                    f"DELETE FROM bot_verify_messages "
-                    f"WHERE created_at < NOW() - INTERVAL '{BOT_MSG_RETENTION_DAYS} days';"
-                )
-
-                await conn.execute(
-                    """
-                    DELETE FROM bot_verify_messages
-                    WHERE message_id IN (
-                        SELECT message_id
-                        FROM bot_verify_messages
-                        ORDER BY created_at DESC
-                        OFFSET $1
-                    );
-                    """,
-                    BOT_MSG_MAX_ROWS
-                )
-            return
-        except Exception:
-            logging.exception("DB track verify message failed attempt=%s", attempt + 1)
-            await asyncio.sleep(1 + attempt)
-
-
 async def db_track_bot_message_id(message_id: int):
     global BOT_ALLMSG_PRUNE_COUNTER
 
@@ -428,9 +390,6 @@ async def send_text(bot, chat_id, thread_id, text):
             "send_message(threaded)"
         )
 
-    if msg and thread_id == VERIFY_THREAD_ID:
-        await db_track_bot_verify_message_id(msg.message_id)
-
     if msg:
         await db_track_bot_message_id(msg.message_id)
 
@@ -469,9 +428,6 @@ async def send_photo(bot, chat_id, thread_id, photo_path, caption, reply_markup)
         return await bot.send_photo(**kwargs)
 
     msg = await safe_send(_do_send, "send_photo")
-
-    if msg and thread_id == VERIFY_THREAD_ID:
-        await db_track_bot_verify_message_id(msg.message_id)
 
     if msg:
         await db_track_bot_message_id(msg.message_id)
@@ -625,4 +581,30 @@ async def post_init(app: Application):
     if ENABLE_DAILY:
         safe_create_task(daily_post_loop(app), "daily_post_loop")
     else:
-        logging.info("ENABLE_DAILY=0_
+        # ✅ FIX: string netjes afgesloten
+        logging.info("ENABLE_DAILY=0 -> daily disabled")
+
+    # blijven bestaan (zoals jij wil), maar hier doen we er niks mee
+    if ENABLE_VERIFY:
+        logging.info("ENABLE_VERIFY=1 (kept, not started)")
+    if ENABLE_ACTIVITY:
+        logging.info("ENABLE_ACTIVITY=1 (kept, not started)")
+
+
+def main():
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN ontbreekt. Zet BOT_TOKEN in Railway Variables.")
+
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+
+    # ✅ Channel /chatid: post /chatid in je channel, bot post chat_id terug
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST & filters.TEXT, on_channel_chatid))
+
+    app.add_handler(CallbackQueryHandler(on_open_group, pattern="^open_group$"))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
