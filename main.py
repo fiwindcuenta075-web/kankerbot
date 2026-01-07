@@ -28,7 +28,7 @@ TZ = ZoneInfo("Europe/Amsterdam")
 RESET_AT = time(5, 0)  # 05:00 Amsterdam boundary
 
 # ✅ Let op: alleen cijfers
-CHAT_ID = -1003328329377
+CHAT_ID = -none
 
 # ✅ JOUW FOTO NAAM
 PHOTO_PATH = "image (6).png"
