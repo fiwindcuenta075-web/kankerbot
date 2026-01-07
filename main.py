@@ -34,7 +34,7 @@ RESET_AT = time(5, 0)  # 05:00 Amsterdam boundary
 # ✅ Groep-id (meestal -100...)
 CHAT_ID = int(os.getenv("CHAT_ID", "-1003418364423"))
 
-# Topics/threads
+# Topics/threads (blijven staan)
 DAILY_THREAD_ID = None
 VERIFY_THREAD_ID = 4
 
@@ -77,12 +77,15 @@ SHARE_TEXT = (
     "https://t.me/pareltjesGW\n\n"
 )
 
-# Deel-link (Telegram share)
+# ✅ Deel-link voor "📤 Delen" (blijft zoals hij nu is)
 SHARE_URL = (
     "https://t.me/share/url?"
     + "url=" + urllib.parse.quote(GROUP_LINK)
     + "&text=" + urllib.parse.quote(SHARE_TEXT)
 )
+
+# ✅ Deel-link alleen voor "📤 0/3"
+SHARE_URL_03 = "https://t.me/share/url?url=%20all%20exclusive%E2%80%94content%20@THPLUS18HUB"
 
 # ✅ Interval pinned (test/normal)
 PINNED_TEXT_SECONDS = 20  # test. normaal: 10*60*60 of 24*60*60
@@ -93,27 +96,14 @@ BOT_MSG_MAX_ROWS = 20000
 BOT_MSG_PRUNE_EVERY = 200
 BOT_ALLMSG_PRUNE_COUNTER = 0
 
-# ✅ extra: verify-topic pruning counter
-BOT_VERIFYMSG_PRUNE_COUNTER = 0
-
 # ===== ENABLE FLAGS via Railway Variables =====
 ENABLE_DAILY = os.getenv("ENABLE_DAILY", "1") == "1"
 ENABLE_CLEANUP = os.getenv("ENABLE_CLEANUP", "1") == "1"
 ENABLE_PINNED_TEXT = os.getenv("ENABLE_PINNED_TEXT", "1") == "1"
 
-# ✅ jij had deze op 0 -> blijft default 0
+# ✅ Jij houdt dit op 0, maar code blijft aanwezig
 ENABLE_VERIFY = os.getenv("ENABLE_VERIFY", "0") == "1"
 ENABLE_ACTIVITY = os.getenv("ENABLE_ACTIVITY", "0") == "1"
-
-# ✅ nieuw: alleen verify-topic cleanup (optioneel)
-ENABLE_VERIFY_TOPIC_CLEANUP = os.getenv("ENABLE_VERIFY_TOPIC_CLEANUP", "0") == "1"
-
-# ✅ nieuw: daily post pinnen (optioneel)
-PIN_DAILY_POST = os.getenv("PIN_DAILY_POST", "0") == "1"
-
-# ✅ optioneel: jouw oude reminder loops apart aan/uit
-ENABLE_REMINDER_VERIFY = os.getenv("ENABLE_REMINDER_VERIFY", "0") == "1"
-ENABLE_REMINDER_ACTIVITY = os.getenv("ENABLE_REMINDER_ACTIVITY", "0") == "1"
 
 # ===== Telegram circuit breaker =====
 TELEGRAM_PAUSE_UNTIL = 0.0  # epoch seconds
@@ -137,26 +127,18 @@ WELCOME_TEXT = (
 
 
 def build_share_keyboard():
+    # ✅ "📤 Delen" blijft de oude / huidige share-url
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Delen", url=SHARE_URL)],
     ])
 
 
 def build_welcome_keyboard():
+    # ✅ "📤 0/3" gebruikt NU de nieuwe share-url
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 0/3", url=SHARE_URL)],
+        [InlineKeyboardButton("📤 0/3", url=SHARE_URL_03)],
         [InlineKeyboardButton("Open group✅", callback_data="open_group")]
     ])
-
-
-# ✅ uit andere code: dezelfde keyboard naam (alias)
-def build_keyboard():
-    return build_welcome_keyboard()
-
-
-# ✅ uit andere code
-def unlocked_text(name: str) -> str:
-    return f"{name} Successfully unlocked the group✅"
 
 
 # ================== SAFETY: TASK CRASH LOGGING ==================
@@ -306,7 +288,6 @@ async def db_init():
         );
         """)
 
-        # ✅ jouw bestaande: alle bot messages (pinned/daily/etc)
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS bot_messages (
             message_id BIGINT PRIMARY KEY,
@@ -317,19 +298,6 @@ async def db_init():
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_bot_messages_created_at
         ON bot_messages(created_at);
-        """)
-
-        # ✅ toegevoegd uit andere code: verify-topic bot messages
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS bot_verify_messages (
-            message_id BIGINT PRIMARY KEY,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        """)
-
-        await conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_bot_verify_messages_created_at
-        ON bot_verify_messages(created_at);
         """)
 
     logging.info("DB initialized ok")
@@ -427,70 +395,20 @@ async def db_track_bot_message_id(message_id: int):
             await asyncio.sleep(1 + attempt)
 
 
-# ✅ toegevoegd: track verify-topic bot messages (optioneel cleanup)
-async def db_track_bot_verify_message_id(message_id: int):
-    global BOT_VERIFYMSG_PRUNE_COUNTER
-
-    for attempt in range(3):
-        try:
-            async with DB_POOL.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO bot_verify_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
-                    int(message_id)
-                )
-
-                BOT_VERIFYMSG_PRUNE_COUNTER += 1
-                if BOT_VERIFYMSG_PRUNE_COUNTER % BOT_MSG_PRUNE_EVERY != 0:
-                    return
-
-                await conn.execute(
-                    f"DELETE FROM bot_verify_messages "
-                    f"WHERE created_at < NOW() - INTERVAL '{BOT_MSG_RETENTION_DAYS} days';"
-                )
-
-                await conn.execute(
-                    """
-                    DELETE FROM bot_verify_messages
-                    WHERE message_id IN (
-                        SELECT message_id
-                        FROM bot_verify_messages
-                        ORDER BY created_at DESC
-                        OFFSET $1
-                    );
-                    """,
-                    BOT_MSG_MAX_ROWS
-                )
-            return
-        except Exception:
-            logging.exception("DB track bot verify message failed attempt=%s", attempt + 1)
-            await asyncio.sleep(1 + attempt)
-
-
 # ================== SEND HELPERS ==================
 async def delete_later(bot, chat_id, message_id, delay_seconds: int):
     await asyncio.sleep(delay_seconds)
     await safe_send(lambda: bot.delete_message(chat_id=chat_id, message_id=message_id), "delete_message(later)")
 
 
-# ✅ aangepast: thread_id support + tracking
-async def send_text(bot, chat_id, text, thread_id: Optional[int] = None):
-    if thread_id is None:
-        msg = await safe_send(lambda: bot.send_message(chat_id=chat_id, text=text), "send_message(main)")
-    else:
-        msg = await safe_send(
-            lambda: bot.send_message(chat_id=chat_id, message_thread_id=thread_id, text=text),
-            f"send_message(thread={thread_id})"
-        )
-
+async def send_text(bot, chat_id, text):
+    msg = await safe_send(lambda: bot.send_message(chat_id=chat_id, text=text), "send_message")
     if msg:
         await db_track_bot_message_id(msg.message_id)
-        if thread_id == VERIFY_THREAD_ID:
-            await db_track_bot_verify_message_id(msg.message_id)
-
     return msg
 
 
-# ✅ aangepast: thread_id + has_spoiler parameter (default False)
+# ✅ has_spoiler is optioneel (default False)
 async def send_photo(
     bot,
     chat_id,
@@ -499,7 +417,6 @@ async def send_photo(
     reply_markup,
     parse_mode: Optional[str] = None,
     has_spoiler: bool = False,
-    thread_id: Optional[int] = None,
 ):
     try:
         with open(photo_path, "rb") as f:
@@ -526,21 +443,12 @@ async def send_photo(
         )
         if parse_mode:
             kwargs["parse_mode"] = parse_mode
-        if thread_id is not None:
-            kwargs["message_thread_id"] = thread_id
 
         return await bot.send_photo(**kwargs)
 
-    msg = await safe_send(
-        _do_send,
-        f"send_photo(thread={thread_id})" if thread_id is not None else "send_photo(main)"
-    )
-
+    msg = await safe_send(_do_send, "send_photo")
     if msg:
         await db_track_bot_message_id(msg.message_id)
-        if thread_id == VERIFY_THREAD_ID:
-            await db_track_bot_verify_message_id(msg.message_id)
-
     return msg
 
 
@@ -588,41 +496,6 @@ async def cleanup_all_bot_messages_loop(app: Application):
         logging.info("Cleanup ALL bot messages at 05:00 done. kept=%d", len(kept))
 
 
-# ✅ toegevoegd: verify-topic cleanup loop (optioneel)
-async def cleanup_verify_topic_loop(app: Application):
-    while True:
-        now = datetime.now(TZ)
-        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
-        if now >= target:
-            target = target + timedelta(days=1)
-
-        await asyncio.sleep(max(1, int((target - now).total_seconds())))
-
-        async with DB_POOL.acquire() as conn:
-            rows = await conn.fetch("SELECT message_id FROM bot_verify_messages;")
-
-        ids = [int(r["message_id"]) for r in rows]
-        kept = []
-
-        for mid in ids:
-            ok = await safe_send(
-                lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=mid),
-                "delete_message(cleanup_verify_topic)"
-            )
-            if ok is None:
-                kept.append(mid)
-
-        async with DB_POOL.acquire() as conn:
-            await conn.execute("TRUNCATE TABLE bot_verify_messages;")
-            if kept:
-                await conn.executemany(
-                    "INSERT INTO bot_verify_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
-                    [(m,) for m in kept]
-                )
-
-        logging.info("Cleanup VERIFY-topic bot messages at 05:00 done. kept=%d", len(kept))
-
-
 async def pinned_caption_loop(app: Application):
     last_pinned_msg_id = None
     while True:
@@ -633,8 +506,7 @@ async def pinned_caption_loop(app: Application):
             CAPTION,
             build_share_keyboard(),
             parse_mode="HTML",
-            has_spoiler=True,   # ✅ alleen deze blurred
-            thread_id=None
+            has_spoiler=False,  # banner NIET blurred
         )
 
         if msg:
@@ -664,8 +536,7 @@ async def daily_post_loop(app: Application):
             WELCOME_TEXT,
             build_welcome_keyboard(),
             parse_mode=None,
-            has_spoiler=False,          # ✅ image (6) NIET blurred
-            thread_id=DAILY_THREAD_ID,  # ✅ thread support
+            has_spoiler=True,  # image (6) WEL blurred
         )
 
         if last_msg_id:
@@ -674,131 +545,10 @@ async def daily_post_loop(app: Application):
         if msg:
             last_msg_id = msg.message_id
 
-            # ✅ optioneel: pin daily post
-            if PIN_DAILY_POST:
-                await safe_send(
-                    lambda: app.bot.pin_chat_message(chat_id=CHAT_ID, message_id=msg.message_id),
-                    "pin_chat_message(daily)"
-                )
-
         await asyncio.sleep(DAILY_SECONDS)
 
 
-# ================== VERIFY/ACTIVITY from other code ==================
-async def verify_random_joiner_loop(app: Application):
-    while True:
-        if JOINED_NAMES:
-            name = random.choice([n for n in JOINED_NAMES if n])
-            if name and (not await db_is_used(name)):
-                await send_text(app.bot, CHAT_ID, unlocked_text(name), thread_id=VERIFY_THREAD_ID)
-                await db_mark_used(name)
-
-        await asyncio.sleep(VERIFY_SECONDS)
-
-
-# ================== ALIAS GENERATOR ==================
-NL_CITY_CODES = ["010", "020", "030", "040", "050", "070", "073", "076", "079", "071", "072", "074", "075", "078"]
-SEPARATORS = ["_", ".", "-"]
-PREFIXES = ["x", "mr", "its", "real", "official", "the", "iam", "nl", "dm", "vip", "urban", "city", "only"]
-EMOJIS = ["🔥", "💎", "👻", "⚡", "🚀", "✅"]
-
-
-def _name_fragments_from_joined():
-    frags = []
-    for n in JOINED_NAMES:
-        n = (n or "").strip().lower()
-        n = "".join(ch for ch in n if ch.isalpha())
-        if len(n) >= 4:
-            for _ in range(2):
-                start = random.randint(0, max(0, len(n) - 3))
-                frag_len = random.randint(2, 4)
-                frag = n[start:start + frag_len]
-                if frag and frag not in frags:
-                    frags.append(frag)
-    return frags
-
-
-def random_alias_from_joined():
-    frags = _name_fragments_from_joined()
-    if not frags:
-        frags = ["nova", "sky", "dex", "luna", "vex", "rio", "mira", "zen"]
-
-    code = random.choice(NL_CITY_CODES)
-    sep = random.choice(SEPARATORS)
-    prefix = random.choice(PREFIXES)
-    frag1 = random.choice(frags)
-    frag2 = random.choice(frags)
-    while frag2 == frag1:
-        frag2 = random.choice(frags)
-
-    digits = "".join(random.choices(string.digits, k=random.randint(2, 4)))
-
-    style = random.choice([
-        "prefix_frag_digits",
-        "frag_code_digits",
-        "frag_frag_digits",
-        "prefix_frag_code",
-        "prefix_frag_sep_frag_digits",
-        "frag_digits_emoji",
-    ])
-
-    if style == "prefix_frag_digits":
-        base = f"{prefix}{sep}{frag1}{digits}"
-    elif style == "frag_code_digits":
-        base = f"{frag1}{sep}{code}{sep}{digits}"
-    elif style == "frag_frag_digits":
-        base = f"{frag1}{sep}{frag2}{digits}"
-    elif style == "prefix_frag_code":
-        base = f"{prefix}{sep}{frag1}{sep}{code}"
-    elif style == "frag_digits_emoji":
-        base = f"{frag1}{digits}{random.choice(EMOJIS)}"
-    else:
-        base = f"{prefix}{sep}{frag1}{sep}{frag2}{sep}{digits}"
-
-    base = base.strip()
-    if not base or base.isdigit():
-        base = f"user{sep}{digits}"
-    return base
-
-
-async def activity_loop(app: Application):
-    while True:
-        alias = random_alias_from_joined()
-        text = f"{alias} Successfully unlocked the group✅"
-
-        msg = await send_text(app.bot, CHAT_ID, text, thread_id=VERIFY_THREAD_ID)
-
-        if msg:
-            safe_create_task(delete_later(app.bot, CHAT_ID, msg.message_id, DELETE_LEAVE_SECONDS), "delete_activity_msg")
-
-        await asyncio.sleep(ACTIVITY_SECONDS)
-
-
-# ================== YOUR OLD REMINDER LOOPS (optional) ==================
-async def verify_reminder_loop(app: Application):
-    while True:
-        if JOINED_NAMES:
-            key = "verify_reminder"
-            if not await db_is_used(key):
-                await send_text(app.bot, CHAT_ID, "✅ Reminder: lees de pinned post en volg de stappen.")
-                await db_mark_used(key)
-        await asyncio.sleep(VERIFY_SECONDS)
-
-
-async def activity_reminder_loop(app: Application):
-    while True:
-        await send_text(app.bot, CHAT_ID, "📌 Reminder: houd de groep netjes en lees de regels.")
-        await asyncio.sleep(ACTIVITY_SECONDS)
-
-
-# ================== HANDLERS ==================
-async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer(
-        "Can’t acces the group, because unfortunately you haven’t shared the group 3 times yet.",
-        show_alert=True
-    )
-
-
+# ================== VERIFY/ACTIVITY (kept in code, default disabled) ==================
 async def announce_join_after_delay(context: ContextTypes.DEFAULT_TYPE, name: str):
     await asyncio.sleep(JOIN_DELAY_SECONDS)
     name = (name or "").strip()
@@ -826,6 +576,30 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
             safe_create_task(announce_join_after_delay(context, name), f"announce_join_after_delay({name})")
 
 
+async def verify_loop(app: Application):
+    while True:
+        if JOINED_NAMES:
+            key = "verify_reminder"
+            if not await db_is_used(key):
+                await send_text(app.bot, CHAT_ID, "✅ Reminder: lees de pinned post en volg de stappen.")
+                await db_mark_used(key)
+        await asyncio.sleep(VERIFY_SECONDS)
+
+
+async def activity_loop(app: Application):
+    while True:
+        await send_text(app.bot, CHAT_ID, "📌 Reminder: houd de groep netjes en lees de regels.")
+        await asyncio.sleep(ACTIVITY_SECONDS)
+
+
+# ================== HANDLERS ==================
+async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer(
+        "Can’t acces the group, because unfortunately you haven’t shared the group 3 times yet.",
+        show_alert=True
+    )
+
+
 # ================== INIT ==================
 async def post_init(app: Application):
     me = await app.bot.get_me()
@@ -843,11 +617,6 @@ async def post_init(app: Application):
     else:
         logging.info("ENABLE_CLEANUP=0 -> cleanup disabled")
 
-    if ENABLE_VERIFY_TOPIC_CLEANUP:
-        safe_create_task(cleanup_verify_topic_loop(app), "cleanup_verify_topic_loop")
-    else:
-        logging.info("ENABLE_VERIFY_TOPIC_CLEANUP=0 -> verify-topic cleanup disabled")
-
     if ENABLE_PINNED_TEXT:
         safe_create_task(pinned_caption_loop(app), "pinned_caption_loop")
     else:
@@ -858,9 +627,8 @@ async def post_init(app: Application):
     else:
         logging.info("ENABLE_DAILY=0 -> daily disabled")
 
-    # ✅ verify/activity uit jouw andere code
     if ENABLE_VERIFY:
-        safe_create_task(verify_random_joiner_loop(app), "verify_random_joiner_loop")
+        safe_create_task(verify_loop(app), "verify_loop")
     else:
         logging.info("ENABLE_VERIFY=0 -> verify disabled")
 
@@ -868,17 +636,6 @@ async def post_init(app: Application):
         safe_create_task(activity_loop(app), "activity_loop")
     else:
         logging.info("ENABLE_ACTIVITY=0 -> activity disabled")
-
-    # ✅ jouw oude reminders (optioneel)
-    if ENABLE_REMINDER_VERIFY:
-        safe_create_task(verify_reminder_loop(app), "verify_reminder_loop")
-    else:
-        logging.info("ENABLE_REMINDER_VERIFY=0 -> verify reminders disabled")
-
-    if ENABLE_REMINDER_ACTIVITY:
-        safe_create_task(activity_reminder_loop(app), "activity_reminder_loop")
-    else:
-        logging.info("ENABLE_REMINDER_ACTIVITY=0 -> activity reminders disabled")
 
 
 def main():
