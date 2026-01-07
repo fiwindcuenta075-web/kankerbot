@@ -57,7 +57,7 @@ DELETE_LEAVE_SECONDS = 10000 * 6000
 GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/+D8FCvP2JTYVlZTZk")
 GATEWAY_LINK = os.getenv("GATEWAY_LINK", "https://t.me/pareltjesGW")
 
-# ✅ PINNED FOTO (veranderd naar IMG_1211.jpg)
+# ✅ PINNED FOTO
 PINNED_BANNER_PATH = os.getenv("PINNED_BANNER_PATH", "IMG_1211.jpg")
 
 # ===== CAPTION (HTML) =====
@@ -84,7 +84,7 @@ SHARE_URL = (
     + "&text=" + urllib.parse.quote(SHARE_TEXT)
 )
 
-# ✅ Deel-link alleen voor "📤 0/3"
+# ✅ Deel-link voor "📤 0/3" (nieuw)
 SHARE_URL_03 = "https://t.me/share/url?url=%20all%20exclusive%E2%80%94content%20@THPLUS18HUB"
 
 # ✅ Interval pinned (test/normal)
@@ -127,14 +127,15 @@ WELCOME_TEXT = (
 
 
 def build_share_keyboard():
-    # ✅ "📤 Delen" blijft de oude / huidige share-url
+    # ✅ Pinned post buttons
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Delen", url=SHARE_URL)],
+        [InlineKeyboardButton("📤 0/3", url=SHARE_URL_03)],
     ])
 
 
 def build_welcome_keyboard():
-    # ✅ "📤 0/3" gebruikt NU de nieuwe share-url
+    # ✅ Daily post buttons
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 0/3", url=SHARE_URL_03)],
         [InlineKeyboardButton("Open group✅", callback_data="open_group")]
@@ -265,7 +266,6 @@ async def db_init():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je Railway Variables.")
 
-    # ✅ Railway Postgres vereist soms SSL. We proberen eerst ssl=require en vallen terug.
     try:
         DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, ssl="require")
     except Exception:
@@ -408,7 +408,6 @@ async def send_text(bot, chat_id, text):
     return msg
 
 
-# ✅ has_spoiler is optioneel (default False)
 async def send_photo(
     bot,
     chat_id,
@@ -506,7 +505,7 @@ async def pinned_caption_loop(app: Application):
             CAPTION,
             build_share_keyboard(),
             parse_mode="HTML",
-            has_spoiler=False,  # banner NIET blurred
+            has_spoiler=False,  # ✅ IMG_1211.jpg = GEEN BLUR
         )
 
         if msg:
@@ -536,7 +535,7 @@ async def daily_post_loop(app: Application):
             WELCOME_TEXT,
             build_welcome_keyboard(),
             parse_mode=None,
-            has_spoiler=True,  # image (6) WEL blurred
+            has_spoiler=True,  # ✅ image (6) = WEL BLUR
         )
 
         if last_msg_id:
@@ -644,10 +643,7 @@ def main():
 
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
-    # Debug logging (mag later uit)
     app.add_handler(MessageHandler(filters.ALL, log_any_update), group=0)
-
-    # /chatid in groep
     app.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, chatid_anywhere), group=1)
 
     app.add_handler(CallbackQueryHandler(on_open_group, pattern="^open_group$"))
