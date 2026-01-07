@@ -84,7 +84,7 @@ SHARE_URL = (
     + "&text=" + urllib.parse.quote(SHARE_TEXT)
 )
 
-# ✅ Deel-link voor "📤 0/3" (nieuw)
+# ✅ Deel-link voor "📤 0/3" in de daily welcome post
 SHARE_URL_03 = "https://t.me/share/url?url=%20all%20exclusive%E2%80%94content%20@THPLUS18HUB"
 
 # ✅ Interval pinned (test/normal)
@@ -127,15 +127,14 @@ WELCOME_TEXT = (
 
 
 def build_share_keyboard():
-    # ✅ Pinned post buttons
+    # ✅ Pinned post: alleen "📤 Delen" (GEEN 0/3)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Delen", url=SHARE_URL)],
-        [InlineKeyboardButton("📤 0/3", url=SHARE_URL_03)],
     ])
 
 
 def build_welcome_keyboard():
-    # ✅ Daily post buttons
+    # ✅ Daily post: "📤 0/3" + Open group
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 0/3", url=SHARE_URL_03)],
         [InlineKeyboardButton("Open group✅", callback_data="open_group")]
@@ -266,6 +265,7 @@ async def db_init():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je Railway Variables.")
 
+    # ✅ Railway Postgres vereist soms SSL. We proberen eerst ssl=require en vallen terug.
     try:
         DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, ssl="require")
     except Exception:
@@ -643,7 +643,10 @@ def main():
 
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
+    # Debug logging (mag later uit)
     app.add_handler(MessageHandler(filters.ALL, log_any_update), group=0)
+
+    # /chatid in groep
     app.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, chatid_anywhere), group=1)
 
     app.add_handler(CallbackQueryHandler(on_open_group, pattern="^open_group$"))
