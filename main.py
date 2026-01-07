@@ -52,8 +52,12 @@ DELETE_DAILY_SECONDS = 17
 DELETE_LEAVE_SECONDS = 10000 * 6000
 
 # ✅ Nieuw: pinned tekstbericht elke 10 uur
-PINNED_TEXT = "hallo doei seconde"
-PINNED_TEXT_SECONDS = 10 * 60 * 60  # 10 uur (test). Normaal: 24*60*60
+PINNED_TEXT = "Are your passwords or social accounts, or more. exposed?
+Find out in seconds.
+👉 benikexposed.nl
+
+CHECK OUR NEW GATEWAY GROUP: https://t.me/pareltjesGW"
+PINNED_TEXT_SECONDS = 20  # 10 uur (test). Normaal: 24*60*60
 
 # ===== retention/cap logging =====
 BOT_MSG_RETENTION_DAYS = 2
