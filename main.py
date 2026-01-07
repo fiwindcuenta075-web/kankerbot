@@ -91,7 +91,7 @@ WELCOME_TEXT = (
 )
 
 SHARE_URL = (
-    "https://t.me/share/url?url=%20all%20exclusive%E2%80%94content%20"
+    "https://t.me/share/url?url=%20all%20exclusive%E2%80%94content%20@THPLUS18HUB"
     "https%3A%2F%2Ft.me%2F%2BAiDsi2LccXJmMjlh"
 )
 
