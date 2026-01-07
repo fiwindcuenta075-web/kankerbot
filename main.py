@@ -31,8 +31,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TZ = ZoneInfo("Europe/Amsterdam")
 RESET_AT = time(5, 0)  # 05:00 Amsterdam boundary
 
-# ✅ Channel ID (vast)
-CHAT_ID = -1003328329377
+# ✅ GROEP ID (vast)
+CHAT_ID = -1003418364423
 
 # ✅ JOUW FOTO NAAM
 PHOTO_PATH = "image (6).png"
@@ -335,9 +335,8 @@ async def safe_send(coro_factory, what: str, max_retries: int = 5):
             await asyncio.sleep(sleep_s)
 
         except (TimedOut, NetworkError) as e:
-            # ✅ "Chat not found" is geen netwerk probleem -> niet backoffen / geen circuit breaker
             if "chat not found" in str(e).lower():
-                logging.error("%s failed: Chat not found (check bot is admin in channel + CHAT_ID)", what)
+                logging.error("%s failed: Chat not found (check bot is in the group + CHAT_ID)", what)
                 return None
 
             failures += 1
@@ -424,39 +423,6 @@ async def send_photo(
     return msg
 
 
-# ================== DEBUG: LOG ALL UPDATES + /chatid ANYWHERE ==================
-async def log_any_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    msg = update.effective_message
-
-    chat_id = getattr(chat, "id", None)
-    chat_type = getattr(chat, "type", None)
-    title = getattr(chat, "title", None)
-    text = getattr(msg, "text", None)
-
-    logging.info("UPDATE IN -> chat_id=%s type=%s title=%s text=%r", chat_id, chat_type, title, text)
-
-
-async def chatid_anywhere(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    chat = update.effective_chat
-    if not msg or not chat:
-        return
-
-    text = (msg.text or "").strip()
-    if not text:
-        return
-
-    if not (text == "/chatid" or text.startswith("/chatid@")):
-        return
-
-    title = getattr(chat, "title", None)
-    out = f"Chat ID: {chat.id}\nType: {chat.type}\nTitle: {title}"
-    logging.info("CHATID OUT -> %s", out)
-
-    await safe_send(lambda: context.bot.send_message(chat_id=chat.id, text=out), "send_chatid_anywhere")
-
-
 # ================== LOOPS ==================
 async def reset_loop():
     while True:
@@ -489,7 +455,6 @@ async def cleanup_all_bot_messages_loop(app: Application):
                 lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=mid),
                 "delete_message(cleanup_all)"
             )
-            # _DELETE_SKIPPED_OK counts as success, so don't keep it
             if ok is None:
                 kept.append(mid)
 
@@ -569,7 +534,6 @@ async def verify_random_joiner_loop(app: Application):
         await asyncio.sleep(VERIFY_SECONDS)
 
 
-# ================== ALIAS GENERATOR ==================
 NL_CITY_CODES = ["010","020","030","040","050","070","073","076","079","071","072","074","075","078"]
 SEPARATORS = ["_", ".", "-"]
 PREFIXES = ["x", "mr", "its", "real", "official", "the", "iam", "nl", "dm", "vip", "urban", "city", "only"]
@@ -689,7 +653,7 @@ async def post_init(app: Application):
 
     ok = await safe_send(lambda: app.bot.send_message(chat_id=CHAT_ID, text="✅ bot gestart (startup test)"), "startup_test")
     if ok is None:
-        logging.error("Startup test failed - check bot is admin in channel + CHAT_ID.")
+        logging.error("Startup test failed - check bot is in the group + rights + CHAT_ID.")
 
     safe_create_task(reset_loop(), "reset_loop")
 
@@ -723,10 +687,6 @@ def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN ontbreekt. Zet BOT_TOKEN in je Railway Variables.")
     app = Application.builder().token(TOKEN).post_init(post_init).build()
-
-    if ENABLE_DEBUG_UPDATES:
-        app.add_handler(MessageHandler(filters.ALL, log_any_update), group=0)
-        app.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, chatid_anywhere), group=1)
 
     app.add_handler(CallbackQueryHandler(on_open_group, pattern="^open_group$"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
