@@ -31,7 +31,7 @@ TZ = ZoneInfo("Europe/Amsterdam")
 RESET_AT = time(5, 0)  # 05:00 Amsterdam boundary
 
 # ✅ Zet later Railway variable CHAT_ID naar de echte value die je krijgt via /chatid
-CHAT_ID = int(os.getenv("CHAT_ID", "-1003328329377"))
+CHAT_ID = int(os.getenv("CHAT_ID", "-8130017538"))
 
 # Topics/threads bestaan nog, maar worden genegeerd als FORCE_SINGLE_CHANNEL=1
 DAILY_THREAD_ID = None
