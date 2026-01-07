@@ -7,6 +7,7 @@ import time as _time
 from datetime import datetime, time, timedelta, date
 from zoneinfo import ZoneInfo
 from io import BytesIO
+from typing import Optional, List, Dict
 
 import asyncpg
 
@@ -30,16 +31,14 @@ TZ = ZoneInfo("Europe/Amsterdam")
 RESET_AT = time(5, 0)  # 05:00 Amsterdam boundary
 
 # ✅ Let op: alleen cijfers
-CHAT_ID = none
+CHAT_ID = -1003328329377
 
-# Topics/threads (worden genegeerd als FORCE_SINGLE_CHANNEL=1)
 DAILY_THREAD_ID = None
-VERIFY_THREAD_ID = none
+VERIFY_THREAD_ID = 4
 
 # ✅ Alles in 1 channel/chat: forceer geen thread_id mee te sturen
 FORCE_SINGLE_CHANNEL = os.getenv("FORCE_SINGLE_CHANNEL", "1") == "1"
 
-# ✅ JOUW FOTO NAAM
 PHOTO_PATH = "image (6).png"
 
 # TEST intervals (seconds)
@@ -55,7 +54,7 @@ DELETE_LEAVE_SECONDS = 10000 * 6000
 PINNED_TEXT = "hallo doei seconde"
 PINNED_TEXT_SECONDS = 10 * 60 * 60  # 10 uur (test). Normaal: 24*60*60
 
-# ===== OPTIE B: prune verify-message logging =====
+# ===== retention/cap logging =====
 BOT_MSG_RETENTION_DAYS = 2
 BOT_MSG_MAX_ROWS = 20000
 BOT_MSG_PRUNE_EVERY = 200
@@ -73,12 +72,12 @@ ENABLE_PINNED_TEXT = os.getenv("ENABLE_PINNED_TEXT", "1") == "1"
 TELEGRAM_PAUSE_UNTIL = 0.0  # epoch seconds
 
 # ===== Throttle log spam for "paused" =====
-_LAST_PAUSE_LOG_AT: dict[str, float] = {}
+_LAST_PAUSE_LOG_AT: Dict[str, float] = {}
 _PAUSE_LOG_COOLDOWN = 15.0  # seconds per "what"
 
 # ================== DB GLOBALS ==================
-DB_POOL: asyncpg.Pool | None = None
-JOINED_NAMES: list[str] = []
+DB_POOL: Optional[asyncpg.Pool] = None
+JOINED_NAMES: List[str] = []
 
 # ================== CONTENT ==================
 WELCOME_TEXT = (
@@ -122,10 +121,6 @@ def safe_create_task(coro, name: str):
 
 # ================== CYCLE HELPERS ==================
 def current_cycle_date(now: datetime) -> date:
-    """
-    ✅ FIX: return echte datetime.date (geen string)
-    zodat asyncpg een DATE kolom correct kan binden.
-    """
     local = now.astimezone(TZ)
     if local.time() < RESET_AT:
         return local.date() - timedelta(days=1)
@@ -214,9 +209,6 @@ async def db_remember_joined_name(name: str):
 
 
 async def db_is_used(name: str) -> bool:
-    """
-    ✅ FIX: cycle_id param is date, not str.
-    """
     cid = current_cycle_date(datetime.now(TZ))
     async with DB_POOL.acquire() as conn:
         row = await conn.fetchrow(
@@ -227,9 +219,6 @@ async def db_is_used(name: str) -> bool:
 
 
 async def db_mark_used(name: str):
-    """
-    ✅ FIX: cycle_id param is date, not str.
-    """
     cid = current_cycle_date(datetime.now(TZ))
     for attempt in range(3):
         try:
@@ -259,13 +248,11 @@ async def db_track_bot_verify_message_id(message_id: int):
                 if BOT_MSG_PRUNE_COUNTER % BOT_MSG_PRUNE_EVERY != 0:
                     return
 
-                # retention
                 await conn.execute(
                     f"DELETE FROM bot_verify_messages "
                     f"WHERE created_at < NOW() - INTERVAL '{BOT_MSG_RETENTION_DAYS} days';"
                 )
 
-                # cap rows
                 await conn.execute(
                     """
                     DELETE FROM bot_verify_messages
@@ -280,15 +267,11 @@ async def db_track_bot_verify_message_id(message_id: int):
                 )
             return
         except Exception:
-            logging.exception("DB track bot message failed attempt=%s", attempt + 1)
+            logging.exception("DB track verify message failed attempt=%s", attempt + 1)
             await asyncio.sleep(1 + attempt)
 
 
 async def db_track_bot_message_id(message_id: int):
-    """
-    ✅ Track ALLE bot-berichten (text/photo etc) voor daily cleanup om 05:00.
-    Zelfde retention/cap mechanisme als verify logging.
-    """
     global BOT_ALLMSG_PRUNE_COUNTER
 
     for attempt in range(3):
@@ -298,3 +281,453 @@ async def db_track_bot_message_id(message_id: int):
                     "INSERT INTO bot_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
                     int(message_id)
                 )
+
+                BOT_ALLMSG_PRUNE_COUNTER += 1
+                if BOT_ALLMSG_PRUNE_COUNTER % BOT_MSG_PRUNE_EVERY != 0:
+                    return
+
+                await conn.execute(
+                    f"DELETE FROM bot_messages "
+                    f"WHERE created_at < NOW() - INTERVAL '{BOT_MSG_RETENTION_DAYS} days';"
+                )
+
+                await conn.execute(
+                    """
+                    DELETE FROM bot_messages
+                    WHERE message_id IN (
+                        SELECT message_id
+                        FROM bot_messages
+                        ORDER BY created_at DESC
+                        OFFSET $1
+                    );
+                    """,
+                    BOT_MSG_MAX_ROWS
+                )
+            return
+        except Exception:
+            logging.exception("DB track bot message failed attempt=%s", attempt + 1)
+            await asyncio.sleep(1 + attempt)
+
+
+# ================== TELEGRAM SEND ==================
+def _is_delete_not_found(e: BadRequest) -> bool:
+    msg = (str(e) or "").lower()
+    return "message to delete not found" in msg or "message can't be deleted" in msg
+
+
+def _throttled_pause_log(what: str, msg: str):
+    now = _time.time()
+    last = _LAST_PAUSE_LOG_AT.get(what, 0.0)
+    if (now - last) >= _PAUSE_LOG_COOLDOWN:
+        _LAST_PAUSE_LOG_AT[what] = now
+        logging.warning(msg)
+
+
+async def safe_send(coro_factory, what: str, max_retries: int = 5):
+    global TELEGRAM_PAUSE_UNTIL
+
+    now = _time.time()
+    if now < TELEGRAM_PAUSE_UNTIL:
+        wait = int(TELEGRAM_PAUSE_UNTIL - now)
+        _throttled_pause_log(what, f"{what} skipped, Telegram paused for {wait}s")
+        return None
+
+    failures = 0
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            return await coro_factory()
+
+        except RetryAfter as e:
+            sleep_s = e.retry_after + 1
+            logging.warning("%s rate limited. Sleep %ss (attempt %s/%s)", what, sleep_s, attempt, max_retries)
+            await asyncio.sleep(sleep_s)
+
+        except (TimedOut, NetworkError) as e:
+            failures += 1
+            backoff = min(30, 2 ** attempt)
+            logging.warning("%s transient network error: %s. backoff %ss (attempt %s/%s)", what, e, backoff, attempt, max_retries)
+            await asyncio.sleep(backoff)
+
+        except Forbidden as e:
+            logging.exception("%s forbidden (rights/bot kicked?): %s", what, e)
+            return None
+
+        except BadRequest as e:
+            if "delete_message" in what and _is_delete_not_found(e):
+                logging.info("%s: delete skipped (not found/already deleted).", what)
+                return None
+            logging.exception("%s bad request: %s", what, e)
+            return None
+
+        except Exception as e:
+            logging.exception("%s unexpected error: %s", what, e)
+            await asyncio.sleep(2)
+
+    if failures >= 3:
+        TELEGRAM_PAUSE_UNTIL = _time.time() + 300
+        logging.error("Telegram lijkt onbereikbaar. Pauzeer sends voor 5 minuten.")
+
+    logging.error("%s failed after %s retries - skipping", what, max_retries)
+    return None
+
+
+async def delete_later(bot, chat_id, message_id, delay_seconds: int):
+    await asyncio.sleep(delay_seconds)
+    await safe_send(lambda: bot.delete_message(chat_id=chat_id, message_id=message_id), "delete_message")
+
+
+async def send_text(bot, chat_id, thread_id, text):
+    effective_thread_id = None if FORCE_SINGLE_CHANNEL else thread_id
+
+    if effective_thread_id is None:
+        msg = await safe_send(lambda: bot.send_message(chat_id=chat_id, text=text), "send_message(main)")
+    else:
+        msg = await safe_send(
+            lambda: bot.send_message(chat_id=chat_id, message_thread_id=effective_thread_id, text=text),
+            f"send_message(thread={effective_thread_id})"
+        )
+
+    if msg and thread_id == VERIFY_THREAD_ID:
+        await db_track_bot_verify_message_id(msg.message_id)
+
+    if msg:
+        await db_track_bot_message_id(msg.message_id)
+
+    return msg
+
+
+async def send_photo(bot, chat_id, thread_id, photo_path, caption, reply_markup):
+    try:
+        with open(photo_path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        logging.error("PHOTO_PATH not found: %s (staat hij echt in je repo root?)", photo_path)
+        return None
+
+    if not data:
+        logging.error("PHOTO_PATH is empty (0 bytes): %s", photo_path)
+        return None
+
+    effective_thread_id = None if FORCE_SINGLE_CHANNEL else thread_id
+
+    async def _do_send():
+        bio = BytesIO(data)
+        bio.name = os.path.basename(photo_path)
+        bio.seek(0)
+
+        kwargs = dict(
+            chat_id=chat_id,
+            photo=bio,
+            caption=caption,
+            reply_markup=reply_markup,
+            has_spoiler=True
+        )
+        if effective_thread_id is not None:
+            kwargs["message_thread_id"] = effective_thread_id
+
+        return await bot.send_photo(**kwargs)
+
+    msg = await safe_send(_do_send, "send_photo")
+
+    if msg and thread_id == VERIFY_THREAD_ID:
+        await db_track_bot_verify_message_id(msg.message_id)
+
+    if msg:
+        await db_track_bot_message_id(msg.message_id)
+
+    return msg
+
+
+# ================== LOOPS ==================
+async def reset_loop():
+    while True:
+        now = datetime.now(TZ)
+        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
+        if now >= target:
+            target = target + timedelta(days=1)
+
+        await asyncio.sleep(max(1, int((target - now).total_seconds())))
+        logging.info("Cycle boundary reached at 05:00")
+
+
+async def cleanup_verify_topic_loop(app: Application):
+    while True:
+        now = datetime.now(TZ)
+        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
+        if now >= target:
+            target = target + timedelta(days=1)
+
+        await asyncio.sleep(max(1, int((target - now).total_seconds())))
+
+        async with DB_POOL.acquire() as conn:
+            rows = await conn.fetch("SELECT message_id FROM bot_verify_messages;")
+
+        ids = [int(r["message_id"]) for r in rows]
+        kept = []
+
+        for mid in ids:
+            ok = await safe_send(
+                lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=mid),
+                "delete_message(cleanup_verify)"
+            )
+            if ok is None:
+                kept.append(mid)
+
+        async with DB_POOL.acquire() as conn:
+            await conn.execute("TRUNCATE TABLE bot_verify_messages;")
+            if kept:
+                await conn.executemany(
+                    "INSERT INTO bot_verify_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
+                    [(m,) for m in kept]
+                )
+
+        logging.info("Cleanup verify-topic bot messages at 05:00 done. kept=%d", len(kept))
+
+
+async def cleanup_all_bot_messages_loop(app: Application):
+    while True:
+        now = datetime.now(TZ)
+        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
+        if now >= target:
+            target = target + timedelta(days=1)
+
+        await asyncio.sleep(max(1, int((target - now).total_seconds())))
+
+        async with DB_POOL.acquire() as conn:
+            rows = await conn.fetch("SELECT message_id FROM bot_messages;")
+
+        ids = [int(r["message_id"]) for r in rows]
+        kept = []
+
+        for mid in ids:
+            ok = await safe_send(
+                lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=mid),
+                "delete_message(cleanup_all)"
+            )
+            if ok is None:
+                kept.append(mid)
+
+        async with DB_POOL.acquire() as conn:
+            await conn.execute("TRUNCATE TABLE bot_messages;")
+            if kept:
+                await conn.executemany(
+                    "INSERT INTO bot_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
+                    [(m,) for m in kept]
+                )
+
+        logging.info("Cleanup ALL bot messages at 05:00 done. kept=%d", len(kept))
+
+
+async def pinned_text_loop(app: Application):
+    last_pinned_msg_id = None
+
+    while True:
+        msg = await send_text(app.bot, CHAT_ID, None, PINNED_TEXT)
+
+        if msg:
+            await safe_send(
+                lambda: app.bot.pin_chat_message(chat_id=CHAT_ID, message_id=msg.message_id),
+                "pin_chat_message(pinned_text)"
+            )
+
+            if last_pinned_msg_id:
+                await safe_send(
+                    lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=last_pinned_msg_id),
+                    "delete_message(old_pinned_text)"
+                )
+
+            last_pinned_msg_id = msg.message_id
+
+        await asyncio.sleep(PINNED_TEXT_SECONDS)
+
+
+async def daily_post_loop(app: Application):
+    last_msg_id = None
+
+    while True:
+        msg = await send_photo(
+            app.bot, CHAT_ID, DAILY_THREAD_ID,
+            PHOTO_PATH, WELCOME_TEXT, build_keyboard()
+        )
+
+        if last_msg_id:
+            safe_create_task(delete_later(app.bot, CHAT_ID, last_msg_id, DELETE_DAILY_SECONDS), "delete_old_daily")
+
+        if msg:
+            last_msg_id = msg.message_id
+            # ✅ welcome/daily post niet meer pinnen (zoals gevraagd)
+
+        await asyncio.sleep(DAILY_SECONDS)
+
+
+# (blijven in code, maar worden niet gestart)
+async def verify_random_joiner_loop(app: Application):
+    while True:
+        if JOINED_NAMES:
+            name = random.choice([n for n in JOINED_NAMES if n])
+            if name and (not await db_is_used(name)):
+                await send_text(app.bot, CHAT_ID, VERIFY_THREAD_ID, unlocked_text(name))
+                await db_mark_used(name)
+        await asyncio.sleep(VERIFY_SECONDS)
+
+
+NL_CITY_CODES = ["010", "020", "030", "040", "050", "070", "073", "076", "079", "071", "072", "074", "075", "078"]
+SEPARATORS = ["_", ".", "-"]
+PREFIXES = ["x", "mr", "its", "real", "official", "the", "iam", "nl", "dm", "vip", "urban", "city", "only"]
+EMOJIS = ["🔥", "💎", "👻", "⚡", "🚀", "✅"]
+
+
+def _name_fragments_from_joined():
+    frags = []
+    for n in JOINED_NAMES:
+        n = (n or "").strip().lower()
+        n = "".join(ch for ch in n if ch.isalpha())
+        if len(n) >= 4:
+            for _ in range(2):
+                start = random.randint(0, max(0, len(n) - 3))
+                frag_len = random.randint(2, 4)
+                frag = n[start:start + frag_len]
+                if frag and frag not in frags:
+                    frags.append(frag)
+    return frags
+
+
+def random_alias_from_joined():
+    frags = _name_fragments_from_joined()
+    if not frags:
+        frags = ["nova", "sky", "dex", "luna", "vex", "rio", "mira", "zen"]
+
+    code = random.choice(NL_CITY_CODES)
+    sep = random.choice(SEPARATORS)
+    prefix = random.choice(PREFIXES)
+    frag1 = random.choice(frags)
+    frag2 = random.choice(frags)
+    while frag2 == frag1:
+        frag2 = random.choice(frags)
+
+    digits = "".join(random.choices(string.digits, k=random.randint(2, 4)))
+
+    style = random.choice([
+        "prefix_frag_digits",
+        "frag_code_digits",
+        "frag_frag_digits",
+        "prefix_frag_code",
+        "prefix_frag_sep_frag_digits",
+        "frag_digits_emoji",
+    ])
+
+    if style == "prefix_frag_digits":
+        base = f"{prefix}{sep}{frag1}{digits}"
+    elif style == "frag_code_digits":
+        base = f"{frag1}{sep}{code}{sep}{digits}"
+    elif style == "frag_frag_digits":
+        base = f"{frag1}{sep}{frag2}{digits}"
+    elif style == "prefix_frag_code":
+        base = f"{prefix}{sep}{frag1}{sep}{code}"
+    elif style == "frag_digits_emoji":
+        base = f"{frag1}{digits}{random.choice(EMOJIS)}"
+    else:
+        base = f"{prefix}{sep}{frag1}{sep}{frag2}{sep}{digits}"
+
+    base = base.strip()
+    if not base or base.isdigit():
+        base = f"user{sep}{digits}"
+    return base
+
+
+async def activity_loop(app: Application):
+    while True:
+        alias = random_alias_from_joined()
+        text = f"{alias} Successfully unlocked the group✅"
+
+        msg = await send_text(app.bot, CHAT_ID, VERIFY_THREAD_ID, text)
+
+        if msg:
+            safe_create_task(delete_later(app.bot, CHAT_ID, msg.message_id, DELETE_LEAVE_SECONDS), "delete_activity_msg")
+
+        await asyncio.sleep(ACTIVITY_SECONDS)
+
+
+# ================== HANDLERS ==================
+async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer(
+        "Can’t acces the group, because unfortunately you haven’t shared the group 3 times yet.",
+        show_alert=True
+    )
+
+
+async def announce_join_after_delay(context: ContextTypes.DEFAULT_TYPE, name: str):
+    await asyncio.sleep(JOIN_DELAY_SECONDS)
+    name = (name or "").strip()
+    if not name:
+        return
+
+    if await db_is_used(name):
+        return
+
+    await send_text(context.bot, CHAT_ID, VERIFY_THREAD_ID, unlocked_text(name))
+    await db_mark_used(name)
+
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.new_chat_members:
+        return
+    if not update.effective_chat or update.effective_chat.id != CHAT_ID:
+        return
+
+    for member in update.message.new_chat_members:
+        name = (member.full_name or "").strip()
+        if name:
+            await db_remember_joined_name(name)
+            safe_create_task(announce_join_after_delay(context, name), f"announce_join_after_delay({name})")
+
+
+# ================== INIT ==================
+async def post_init(app: Application):
+    me = await app.bot.get_me()
+    logging.info("Bot started: @%s", me.username)
+
+    await db_init()
+    await db_load_joined_names_into_memory()
+
+    ok = await safe_send(lambda: app.bot.send_message(chat_id=CHAT_ID, text="✅ bot gestart (startup test)"), "startup_test")
+    if ok is None:
+        logging.error("Startup test failed - check CHAT_ID, bot rights, Telegram connectivity from Railway.")
+
+    safe_create_task(reset_loop(), "reset_loop")
+
+    if ENABLE_CLEANUP:
+        safe_create_task(cleanup_verify_topic_loop(app), "cleanup_verify_topic_loop")
+        safe_create_task(cleanup_all_bot_messages_loop(app), "cleanup_all_bot_messages_loop")
+    else:
+        logging.info("ENABLE_CLEANUP=0 -> cleanup disabled")
+
+    if ENABLE_PINNED_TEXT:
+        safe_create_task(pinned_text_loop(app), "pinned_text_loop")
+    else:
+        logging.info("ENABLE_PINNED_TEXT=0 -> pinned text disabled")
+
+    if ENABLE_DAILY:
+        safe_create_task(daily_post_loop(app), "daily_post_loop")
+    else:
+        logging.info("ENABLE_DAILY=0 -> daily disabled")
+
+    # Deze blijven bestaan maar worden hier niet gestart.
+    logging.info("verify_random_joiner_loop NOT started (kept in code)")
+    logging.info("activity_loop NOT started (kept in code)")
+
+
+def main():
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN ontbreekt. Zet BOT_TOKEN in je Railway Variables.")
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+
+    app.add_handler(CallbackQueryHandler(on_open_group, pattern="^open_group$"))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
