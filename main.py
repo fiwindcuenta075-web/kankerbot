@@ -30,14 +30,14 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TZ = ZoneInfo("Europe/Amsterdam")
 RESET_AT = time(5, 0)  # 05:00 Amsterdam boundary
 
-# ✅ Zet later Railway variable CHAT_ID naar de echte value die je krijgt via /chatid
+# ✅ Zet Railway variable CHAT_ID naar je groep-id (meestal -100...)
 CHAT_ID = int(os.getenv("CHAT_ID", "-1003418364423"))
 
-# Topics/threads bestaan nog, maar worden genegeerd als FORCE_SINGLE_CHANNEL=1
+# Topics/threads (irrelevant in groups, maar laten staan)
 DAILY_THREAD_ID = None
 VERIFY_THREAD_ID = 4
 
-# ✅ Alles in 1 channel/chat: forceer geen thread_id mee te sturen
+# ✅ Alles in 1 chat: in groups sowieso 1 chat, maar flag laten staan
 FORCE_SINGLE_CHANNEL = os.getenv("FORCE_SINGLE_CHANNEL", "1") == "1"
 
 PHOTO_PATH = "image (6).png"
@@ -51,17 +51,14 @@ ACTIVITY_SECONDS = 25
 DELETE_DAILY_SECONDS = 17
 DELETE_LEAVE_SECONDS = 10000 * 6000
 
-# ✅ Nieuw: pinned tekstbericht elke 10 uur
+# ✅ Pinned tekst
 PINNED_TEXT = """Are your passwords or social accounts, or more. exposed?
 Find out in seconds.
 👉 benikexposed.nl
 
 
 CHECK OUR NEW GATEWAY GROUP: https://t.me/pareltjesGW"""
-
-
-"CHECK OUR NEW GATEWAY GROUP: https://t.me/pareltjesGW"
-PINNED_TEXT_SECONDS = 20  # 10 uur (test). Normaal: 24*60*60
+PINNED_TEXT_SECONDS = 20  # test. normaal: 10*60*60 of 24*60*60
 
 # ===== retention/cap logging =====
 BOT_MSG_RETENTION_DAYS = 2
@@ -74,7 +71,7 @@ ENABLE_DAILY = os.getenv("ENABLE_DAILY", "1") == "1"
 ENABLE_CLEANUP = os.getenv("ENABLE_CLEANUP", "1") == "1"
 ENABLE_PINNED_TEXT = os.getenv("ENABLE_PINNED_TEXT", "1") == "1"
 
-# (blijven bestaan, maar worden niet gestart)
+# ✅ Jij houdt dit op 0, maar code blijft aanwezig
 ENABLE_VERIFY = os.getenv("ENABLE_VERIFY", "0") == "1"
 ENABLE_ACTIVITY = os.getenv("ENABLE_ACTIVITY", "0") == "1"
 
@@ -100,7 +97,6 @@ WELCOME_TEXT = (
 
 SHARE_URL = (
     "https://t.me/share/url?url=%20all%20exclusive%E2%80%94content%20@THPLUS18HUB"
-    
 )
 
 
@@ -109,10 +105,6 @@ def build_keyboard():
         [InlineKeyboardButton("📤 0/3", url=SHARE_URL)],
         [InlineKeyboardButton("Open group✅", callback_data="open_group")]
     ])
-
-
-def unlocked_text(name: str) -> str:
-    return f"{name} Successfully unlocked the group✅"
 
 
 # ================== SAFETY: TASK CRASH LOGGING ==================
@@ -127,6 +119,14 @@ def safe_create_task(coro, name: str):
 
     task.add_done_callback(_done)
     return task
+
+
+# ================== CYCLE HELPERS ==================
+def current_cycle_date(now: datetime) -> date:
+    local = now.astimezone(TZ)
+    if local.time() < RESET_AT:
+        return local.date() - timedelta(days=1)
+    return local.date()
 
 
 # ================== TELEGRAM SEND ==================
@@ -229,9 +229,14 @@ async def chatid_anywhere(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def db_init():
     global DB_POOL
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je BOT service variables.")
+        raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je Railway Variables.")
 
-    DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    # ✅ Railway Postgres vereist soms SSL. We proberen eerst ssl=require en vallen terug.
+    try:
+        DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, ssl="require")
+    except Exception:
+        logging.warning("DB connect with ssl=require failed, retry without ssl...")
+        DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
     async with DB_POOL.acquire() as conn:
         await conn.execute("""
@@ -270,6 +275,52 @@ async def db_load_joined_names_into_memory():
         rows = await conn.fetch("SELECT name FROM joined_names ORDER BY first_seen ASC;")
     JOINED_NAMES = [r["name"] for r in rows]
     logging.info("Loaded %d joined names from DB", len(JOINED_NAMES))
+
+
+async def db_remember_joined_name(name: str):
+    name = (name or "").strip()
+    if not name:
+        return
+
+    for attempt in range(3):
+        try:
+            async with DB_POOL.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO joined_names(name) VALUES($1) ON CONFLICT (name) DO NOTHING;",
+                    name
+                )
+            break
+        except Exception:
+            logging.exception("DB remember name failed attempt=%s", attempt + 1)
+            await asyncio.sleep(1 + attempt)
+
+    if name not in JOINED_NAMES:
+        JOINED_NAMES.append(name)
+
+
+async def db_is_used(key: str) -> bool:
+    cid = current_cycle_date(datetime.now(TZ))
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM used_names WHERE cycle_id = $1 AND name = $2 LIMIT 1;",
+            cid, key
+        )
+    return row is not None
+
+
+async def db_mark_used(key: str):
+    cid = current_cycle_date(datetime.now(TZ))
+    for attempt in range(3):
+        try:
+            async with DB_POOL.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO used_names(cycle_id, name) VALUES($1, $2) ON CONFLICT DO NOTHING;",
+                    cid, key
+                )
+            return
+        except Exception:
+            logging.exception("DB mark used failed attempt=%s", attempt + 1)
+            await asyncio.sleep(1 + attempt)
 
 
 async def db_track_bot_message_id(message_id: int):
@@ -311,6 +362,11 @@ async def db_track_bot_message_id(message_id: int):
 
 
 # ================== SEND HELPERS ==================
+async def delete_later(bot, chat_id, message_id, delay_seconds: int):
+    await asyncio.sleep(delay_seconds)
+    await safe_send(lambda: bot.delete_message(chat_id=chat_id, message_id=message_id), "delete_message(later)")
+
+
 async def send_text(bot, chat_id, text):
     msg = await safe_send(lambda: bot.send_message(chat_id=chat_id, text=text), "send_message")
     if msg:
@@ -397,85 +453,13 @@ async def pinned_text_loop(app: Application):
     while True:
         msg = await send_text(app.bot, CHAT_ID, PINNED_TEXT)
         if msg:
-            await safe_send(lambda: app.bot.pin_chat_message(chat_id=CHAT_ID, message_id=msg.message_id), "pin_chat_message")
+            await safe_send(
+                lambda: app.bot.pin_chat_message(chat_id=CHAT_ID, message_id=msg.message_id),
+                "pin_chat_message(pinned_text)"
+            )
             if last_pinned_msg_id:
-                await safe_send(lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=last_pinned_msg_id), "delete_message(old_pinned)")
-            last_pinned_msg_id = msg.message_id
-        await asyncio.sleep(PINNED_TEXT_SECONDS)
-
-
-async def daily_post_loop(app: Application):
-    last_msg_id = None
-    while True:
-        msg = await send_photo(app.bot, CHAT_ID, PHOTO_PATH, WELCOME_TEXT, build_keyboard())
-        if last_msg_id:
-            # keep your existing behavior: delete old after delay
-            await asyncio.sleep(0)
-        if msg:
-            last_msg_id = msg.message_id
-            # ✅ welcome/daily post niet meer pinnen
-        await asyncio.sleep(DAILY_SECONDS)
-
-
-# ================== HANDLERS ==================
-async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer(
-        "Can’t acces the group, because unfortunately you haven’t shared the group 3 times yet.",
-        show_alert=True
-    )
-
-
-# ================== INIT ==================
-async def post_init(app: Application):
-    me = await app.bot.get_me()
-    logging.info("Bot started: @%s", me.username)
-
-    await db_init()
-    await db_load_joined_names_into_memory()
-
-    # Startup test (may fail until CHAT_ID is correct)
-    await safe_send(lambda: app.bot.send_message(chat_id=CHAT_ID, text="✅ bot gestart (startup test)"), "startup_test")
-
-    safe_create_task(reset_loop(), "reset_loop")
-
-    if ENABLE_CLEANUP:
-        safe_create_task(cleanup_all_bot_messages_loop(app), "cleanup_all_bot_messages_loop")
-    else:
-        logging.info("ENABLE_CLEANUP=0 -> cleanup disabled")
-
-    if ENABLE_PINNED_TEXT:
-        safe_create_task(pinned_text_loop(app), "pinned_text_loop")
-    else:
-        logging.info("ENABLE_PINNED_TEXT=0 -> pinned text disabled")
-
-    if ENABLE_DAILY:
-        safe_create_task(daily_post_loop(app), "daily_post_loop")
-    else:
-        logging.info("ENABLE_DAILY=0 -> daily disabled")
-
-    if ENABLE_VERIFY:
-        logging.info("ENABLE_VERIFY=1 (kept, not started)")
-    if ENABLE_ACTIVITY:
-        logging.info("ENABLE_ACTIVITY=1 (kept, not started)")
-
-
-def main():
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN ontbreekt. Zet BOT_TOKEN in Railway Variables.")
-
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
-
-    # Log everything to Railway logs
-    app.add_handler(MessageHandler(filters.ALL, log_any_update), group=0)
-
-    # /chatid works in channel posts AND in groups/DMs (if message reaches bot)
-    app.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, chatid_anywhere), group=1)
-
-    app.add_handler(CallbackQueryHandler(on_open_group, pattern="^open_group$"))
-
-    # ✅ Force all update types (includes channel_post)
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+                await safe_send(
+                    lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=last_pinned_msg_id),
+                    "delete_message(old_pinned)"
+                )
+            last_pinned_msg_id = msg.mes_
