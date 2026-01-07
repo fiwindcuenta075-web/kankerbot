@@ -289,7 +289,8 @@ async def db_track_bot_message_id(message_id: int):
 
 
 # ================== TELEGRAM SEND ==================
-def _is_delete_not_found(e: BadRequest) -> bool:
+# ✅ FIX: accepteer elke Exception (soms komt delete-not-found binnen als NetworkError)
+def _is_delete_not_found(e: Exception) -> bool:
     msg = (str(e) or "").lower()
     return "message to delete not found" in msg or "message can't be deleted" in msg
 
@@ -302,7 +303,7 @@ def _throttled_pause_log(what: str, msg: str):
         logging.warning(msg)
 
 
-# ===== Sentinel for delete-not-found success (BIGGEST BUG FIX) =====
+# ===== Sentinel for delete-not-found success =====
 _DELETE_SKIPPED_OK = object()
 
 
@@ -327,13 +328,21 @@ async def safe_send(coro_factory, what: str, max_retries: int = 5):
             await asyncio.sleep(sleep_s)
 
         except (TimedOut, NetworkError) as e:
+            # ✅ FIX: delete "not found" is normaal -> NIET retryen / NIET circuit-breaken
+            if "delete_message" in what and _is_delete_not_found(e):
+                logging.info("%s: delete skipped (not found/already deleted).", what)
+                return _DELETE_SKIPPED_OK
+
             if "chat not found" in str(e).lower():
                 logging.error("%s failed: Chat not found (check bot is in the group + CHAT_ID)", what)
                 return None
 
             failures += 1
             backoff = min(30, 2 ** attempt)
-            logging.warning("%s transient network error: %s. backoff %ss (attempt %s/%s)", what, e, backoff, attempt, max_retries)
+            logging.warning(
+                "%s transient network error: %s. backoff %ss (attempt %s/%s)",
+                what, e, backoff, attempt, max_retries
+            )
             await asyncio.sleep(backoff)
 
         except Forbidden as e:
@@ -423,14 +432,13 @@ async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ✅ NEW: delete the "pinned a photo" service message immediately
+# ✅ delete the "pinned a photo" service message immediately
 async def on_pinned_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or update.effective_chat.id != CHAT_ID:
         return
     if not update.message:
         return
 
-    # This message itself is the service message ("pinned a ...")
     service_mid = update.message.message_id
     await safe_send(
         lambda: context.bot.delete_message(chat_id=CHAT_ID, message_id=service_mid),
@@ -461,7 +469,7 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = (member.full_name or "").strip()
         if name:
             await db_remember_joined_name(name)
-            safe_create_task(announce_join_after_delay(context, name), f"announce_join_after_delay({name})")
+            safe_create_task(announce_join_after_delay(context, name), "announce_join_after_delay")
 
 
 # ================== LOOPS ==================
@@ -560,7 +568,7 @@ async def daily_post_loop(app: Application):
 
         if msg:
             last_msg_id = msg.message_id
-            # ✅ IMPORTANT: daily is NOT pinned anymore (only Pareltjes pinned)
+            # ✅ DAILY WORDT NIET GEPINNED (alleen Pareltjes caption loop)
 
         await asyncio.sleep(DAILY_SECONDS)
 
