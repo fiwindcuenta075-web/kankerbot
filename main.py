@@ -17,7 +17,7 @@ from telegram.ext import (
     ContextTypes,
     CallbackQueryHandler,
     MessageHandler,
-    CommandHandler,
+    TypeHandler,
     filters,
 )
 from telegram.error import RetryAfter, TimedOut, NetworkError, Forbidden, BadRequest
@@ -32,10 +32,9 @@ TZ = ZoneInfo("Europe/Amsterdam")
 RESET_AT = time(5, 0)  # 05:00 Amsterdam boundary
 
 # ✅ Zet hier je target chat/channel ID in (meestal -100...)
-# Tip: gebruik /chatid in de chat om hem te vinden.
+# Tip: post /chatid in je channel om hem te vinden.
 CHAT_ID = int(os.getenv("CHAT_ID", "-1003328329377"))
 
-# Topics/threads (blijven bestaan maar worden genegeerd als FORCE_SINGLE_CHANNEL=1)
 DAILY_THREAD_ID = None
 VERIFY_THREAD_ID = 4
 
@@ -69,7 +68,7 @@ ENABLE_DAILY = os.getenv("ENABLE_DAILY", "1") == "1"
 ENABLE_CLEANUP = os.getenv("ENABLE_CLEANUP", "1") == "1"
 ENABLE_PINNED_TEXT = os.getenv("ENABLE_PINNED_TEXT", "1") == "1"
 
-# ⚠️ Deze bestaan nog als env vars, maar de loops zelf zijn hard disabled hieronder
+# (bestaan nog, maar loops zijn hard disabled verderop)
 ENABLE_VERIFY = os.getenv("ENABLE_VERIFY", "0") == "1"
 ENABLE_ACTIVITY = os.getenv("ENABLE_ACTIVITY", "0") == "1"
 
@@ -110,14 +109,32 @@ def unlocked_text(name: str) -> str:
     return f"{name} Successfully unlocked the group✅"
 
 
-# ================== DEBUG: CHAT ID ==================
-async def debug_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================== DEBUG: CHAT ID (CHANNEL-SAFE) ==================
+async def chatid_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Works for: private/group messages AND channel posts.
+    In a channel, you must post: /chatid
+    Bot must be admin with permission to post messages.
+    """
+    msg = update.effective_message
     chat = update.effective_chat
+    if not msg or not chat:
+        return
+
+    text = (msg.text or "").strip()
+    if not text:
+        return
+
+    cmd = text.split()[0]
+    if not (cmd == "/chatid" or cmd.startswith("/chatid@")):
+        return
+
     title = getattr(chat, "title", None)
-    await update.message.reply_text(
-        f"Chat ID: {chat.id}\nType: {chat.type}\nTitle: {title}"
-    )
+    out = f"Chat ID: {chat.id}\nType: {chat.type}\nTitle: {title}"
     logging.info("CHATID -> id=%s type=%s title=%s", chat.id, chat.type, title)
+
+    # In channels: reply_text is often not usable; send a normal message to the channel.
+    await safe_send(lambda: context.bot.send_message(chat_id=chat.id, text=out), "debug_send_chatid")
 
 
 # ================== SAFETY: TASK CRASH LOGGING ==================
@@ -146,7 +163,7 @@ def current_cycle_date(now: datetime) -> date:
 async def db_init():
     global DB_POOL
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je Railway Variables.")
+        raise RuntimeError("DATABASE_URL ontbreekt. Zet DATABASE_URL in je BOT service variables.")
 
     DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
@@ -178,7 +195,6 @@ async def db_init():
         ON bot_verify_messages(created_at);
         """)
 
-        # ✅ Nieuw: alle bot-berichten tracken zodat we om 05:00 kunnen deleten
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS bot_messages (
             message_id BIGINT PRIMARY KEY,
@@ -316,213 +332,3 @@ async def db_track_bot_message_id(message_id: int):
                         OFFSET $1
                     );
                     """,
-                    BOT_MSG_MAX_ROWS
-                )
-            return
-        except Exception:
-            logging.exception("DB track bot message failed attempt=%s", attempt + 1)
-            await asyncio.sleep(1 + attempt)
-
-
-# ================== TELEGRAM SEND ==================
-def _is_delete_not_found(e: BadRequest) -> bool:
-    msg = (str(e) or "").lower()
-    return "message to delete not found" in msg or "message can't be deleted" in msg
-
-
-def _throttled_pause_log(what: str, msg: str):
-    now = _time.time()
-    last = _LAST_PAUSE_LOG_AT.get(what, 0.0)
-    if (now - last) >= _PAUSE_LOG_COOLDOWN:
-        _LAST_PAUSE_LOG_AT[what] = now
-        logging.warning(msg)
-
-
-async def safe_send(coro_factory, what: str, max_retries: int = 5):
-    global TELEGRAM_PAUSE_UNTIL
-
-    now = _time.time()
-    if now < TELEGRAM_PAUSE_UNTIL:
-        wait = int(TELEGRAM_PAUSE_UNTIL - now)
-        _throttled_pause_log(what, f"{what} skipped, Telegram paused for {wait}s")
-        return None
-
-    failures = 0
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            return await coro_factory()
-
-        except RetryAfter as e:
-            sleep_s = e.retry_after + 1
-            logging.warning("%s rate limited. Sleep %ss (attempt %s/%s)", what, sleep_s, attempt, max_retries)
-            await asyncio.sleep(sleep_s)
-
-        except (TimedOut, NetworkError) as e:
-            failures += 1
-            backoff = min(30, 2 ** attempt)
-            logging.warning("%s transient network error: %s. backoff %ss (attempt %s/%s)", what, e, backoff, attempt, max_retries)
-            await asyncio.sleep(backoff)
-
-        except Forbidden as e:
-            logging.exception("%s forbidden (rights/bot kicked?): %s", what, e)
-            return None
-
-        except BadRequest as e:
-            if "delete_message" in what and _is_delete_not_found(e):
-                logging.info("%s: delete skipped (not found/already deleted).", what)
-                return None
-            logging.exception("%s bad request: %s", what, e)
-            return None
-
-        except Exception as e:
-            logging.exception("%s unexpected error: %s", what, e)
-            await asyncio.sleep(2)
-
-    if failures >= 3:
-        TELEGRAM_PAUSE_UNTIL = _time.time() + 300
-        logging.error("Telegram lijkt onbereikbaar. Pauzeer sends voor 5 minuten.")
-
-    logging.error("%s failed after %s retries - skipping", what, max_retries)
-    return None
-
-
-async def delete_later(bot, chat_id, message_id, delay_seconds: int):
-    await asyncio.sleep(delay_seconds)
-    await safe_send(lambda: bot.delete_message(chat_id=chat_id, message_id=message_id), "delete_message")
-
-
-async def send_text(bot, chat_id, thread_id, text):
-    effective_thread_id = None if FORCE_SINGLE_CHANNEL else thread_id
-
-    if effective_thread_id is None:
-        msg = await safe_send(lambda: bot.send_message(chat_id=chat_id, text=text), "send_message(main)")
-    else:
-        msg = await safe_send(
-            lambda: bot.send_message(chat_id=chat_id, message_thread_id=effective_thread_id, text=text),
-            f"send_message(thread={effective_thread_id})"
-        )
-
-    if msg and thread_id == VERIFY_THREAD_ID:
-        await db_track_bot_verify_message_id(msg.message_id)
-
-    if msg:
-        await db_track_bot_message_id(msg.message_id)
-
-    return msg
-
-
-async def send_photo(bot, chat_id, thread_id, photo_path, caption, reply_markup):
-    try:
-        with open(photo_path, "rb") as f:
-            data = f.read()
-    except FileNotFoundError:
-        logging.error("PHOTO_PATH not found: %s (staat hij echt in je repo root?)", photo_path)
-        return None
-
-    if not data:
-        logging.error("PHOTO_PATH is empty (0 bytes): %s", photo_path)
-        return None
-
-    effective_thread_id = None if FORCE_SINGLE_CHANNEL else thread_id
-
-    async def _do_send():
-        bio = BytesIO(data)
-        bio.name = os.path.basename(photo_path)
-        bio.seek(0)
-
-        kwargs = dict(
-            chat_id=chat_id,
-            photo=bio,
-            caption=caption,
-            reply_markup=reply_markup,
-            has_spoiler=True
-        )
-        if effective_thread_id is not None:
-            kwargs["message_thread_id"] = effective_thread_id
-
-        return await bot.send_photo(**kwargs)
-
-    msg = await safe_send(_do_send, "send_photo")
-
-    if msg and thread_id == VERIFY_THREAD_ID:
-        await db_track_bot_verify_message_id(msg.message_id)
-
-    if msg:
-        await db_track_bot_message_id(msg.message_id)
-
-    return msg
-
-
-# ================== LOOPS ==================
-async def reset_loop():
-    while True:
-        now = datetime.now(TZ)
-        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
-        if now >= target:
-            target = target + timedelta(days=1)
-
-        await asyncio.sleep(max(1, int((target - now).total_seconds())))
-        logging.info("Cycle boundary reached at 05:00")
-
-
-async def cleanup_verify_topic_loop(app: Application):
-    while True:
-        now = datetime.now(TZ)
-        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
-        if now >= target:
-            target = target + timedelta(days=1)
-
-        await asyncio.sleep(max(1, int((target - now).total_seconds())))
-
-        async with DB_POOL.acquire() as conn:
-            rows = await conn.fetch("SELECT message_id FROM bot_verify_messages;")
-
-        ids = [int(r["message_id"]) for r in rows]
-        kept = []
-
-        for mid in ids:
-            ok = await safe_send(
-                lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=mid),
-                "delete_message(cleanup_verify)"
-            )
-            if ok is None:
-                kept.append(mid)
-
-        async with DB_POOL.acquire() as conn:
-            await conn.execute("TRUNCATE TABLE bot_verify_messages;")
-            if kept:
-                await conn.executemany(
-                    "INSERT INTO bot_verify_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
-                    [(m,) for m in kept]
-                )
-
-        logging.info("Cleanup verify-topic bot messages at 05:00 done. kept=%d", len(kept))
-
-
-async def cleanup_all_bot_messages_loop(app: Application):
-    while True:
-        now = datetime.now(TZ)
-        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
-        if now >= target:
-            target = target + timedelta(days=1)
-
-        await asyncio.sleep(max(1, int((target - now).total_seconds())))
-
-        async with DB_POOL.acquire() as conn:
-            rows = await conn.fetch("SELECT message_id FROM bot_messages;")
-
-        ids = [int(r["message_id"]) for r in rows]
-        kept = []
-
-        for mid in ids:
-            ok = await safe_send(
-                lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=mid),
-                "delete_message(cleanup_all)"
-            )
-            if ok is None:
-                kept.append(mid)
-
-        async with DB_POOL.acquire() as conn:
-            await conn.execute("TRUNCATE TABLE bot_messages;")
-            if kept:
