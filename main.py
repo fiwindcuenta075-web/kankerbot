@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import time as _time
-import json  # ✅ toegevoegd
+import json
 from datetime import datetime, time, timedelta, date
 from zoneinfo import ZoneInfo
 from io import BytesIO
@@ -28,8 +28,8 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 TZ = ZoneInfo("Europe/Amsterdam")
 RESET_AT = time(5, 0)  # 05:00 Amsterdam boundary
 
-# ✅ Zet tijdelijk op None (we lezen de echte group id uit logs)
-CHAT_ID = None  # <-- vul later in met -100...
+# ✅ tijdelijk None: we lezen de echte groeps-id uit DEBUG_UPDATE logs
+CHAT_ID = None
 
 # ✅ JOUW FOTO NAAM
 PHOTO_PATH = "image (6).png"
@@ -80,15 +80,16 @@ def build_keyboard():
 def verified_text(name: str) -> str:
     return f"{name} verified ✅"
 
-# ================== DEBUG: LOG ALL UPDATES ==================
+# ================== DEBUG: LOG RAW UPDATES ==================
 async def log_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Logt raw update JSON zodat je de chat.id van de groep ziet in Northflank logs.
-    Stuur een bericht in de groep en zoek naar: DEBUG_UPDATE:
+    Logt raw update JSON zodat je de chat.id van de andere groep ziet.
+    Zoek in logs naar: DEBUG_UPDATE:
     """
     try:
         j = update.to_dict()
-        chat = j.get("message", {}).get("chat", {}) or j.get("channel_post", {}).get("chat", {})
+        # message / channel_post zijn de meest voorkomende
+        chat = (j.get("message", {}) or {}).get("chat", {}) or (j.get("channel_post", {}) or {}).get("chat", {})
         chat_id = chat.get("id")
         title = chat.get("title")
         logging.info("DEBUG_UPDATE: chat_id=%s title=%s raw=%s", chat_id, title, json.dumps(j, ensure_ascii=False))
@@ -162,7 +163,8 @@ async def db_track_chat_message_id(message_id: int):
                     return
 
                 await conn.execute(
-                    f"DELETE FROM chat_messages WHERE created_at < NOW() - INTERVAL '{TRACK_RETENTION_DAYS} days';"
+                    f"DELETE FROM chat_messages "
+                    f"WHERE created_at < NOW() - INTERVAL '{TRACK_RETENTION_DAYS} days';"
                 )
 
                 await conn.execute(
@@ -297,122 +299,4 @@ async def send_photo(bot, chat_id, photo_path, caption, reply_markup):
         bio.name = os.path.basename(photo_path)
         bio.seek(0)
         return await bot.send_photo(
-            chat_id=chat_id,
-            photo=bio,
-            caption=caption,
-            reply_markup=reply_markup,
-            has_spoiler=True
-        )
-
-    msg = await safe_send(_do_send, "send_photo(main)")
-    if msg:
-        await db_track_chat_message_id(msg.message_id)
-    return msg
-
-# ================== LOOPS ==================
-async def reset_loop():
-    while True:
-        now = datetime.now(TZ)
-        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
-        if now >= target:
-            target = target + timedelta(days=1)
-
-        await asyncio.sleep(max(1, int((target - now).total_seconds())))
-        logging.info("Cycle boundary reached at 05:00")
-
-async def daily_post_loop(app: Application):
-    last_msg_id = None
-
-    while True:
-        msg = await send_photo(app.bot, CHAT_ID, PHOTO_PATH, WELCOME_TEXT, build_keyboard())
-
-        if last_msg_id:
-            safe_create_task(delete_later(app.bot, CHAT_ID, last_msg_id, DELETE_DAILY_SECONDS), "delete_old_daily")
-
-        if msg:
-            last_msg_id = msg.message_id
-
-        await asyncio.sleep(DAILY_SECONDS)
-
-async def pinned_post_loop(app: Application):
-    while True:
-        msg = await send_text(app.bot, CHAT_ID, PIN_TEXT)
-
-        if msg:
-            await safe_send(lambda: app.bot.pin_chat_message(chat_id=CHAT_ID, message_id=msg.message_id),
-                            "pin_chat_message(pinned_loop)")
-            safe_create_task(delete_later(app.bot, CHAT_ID, msg.message_id, DELETE_PIN_SECONDS),
-                             "delete_pinned_after_15s")
-
-        await asyncio.sleep(PIN_EVERY_SECONDS)
-
-async def purge_all_messages_at_5_loop(app: Application):
-    while True:
-        now = datetime.now(TZ)
-        target = datetime.combine(now.date(), RESET_AT, tzinfo=TZ)
-        if now >= target:
-            target = target + timedelta(days=1)
-
-        await asyncio.sleep(max(1, int((target - now).total_seconds())))
-
-        async with DB_POOL.acquire() as conn:
-            rows = await conn.fetch("SELECT message_id FROM chat_messages ORDER BY created_at ASC;")
-
-        ids = [int(r["message_id"]) for r in rows]
-        logging.info("05:00 purge starting. tracked_ids=%d", len(ids))
-
-        kept = []
-        for mid in ids:
-            ok = await safe_send(lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=mid), "purge_delete_message")
-            if ok is None:
-                kept.append(mid)
-
-        async with DB_POOL.acquire() as conn:
-            await conn.execute("TRUNCATE TABLE chat_messages;")
-            if kept:
-                await conn.executemany(
-                    "INSERT INTO chat_messages(message_id) VALUES($1) ON CONFLICT DO NOTHING;",
-                    [(m,) for m in kept]
-                )
-
-        logging.info("05:00 purge done. kept=%d", len(kept))
-
-# ================== HANDLERS ==================
-async def on_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q:
-        return
-
-    user = update.effective_user
-    name = (user.full_name if user else "") or "User"
-
-    await q.answer("Verified ✅", show_alert=True)
-    await send_text(context.bot, CHAT_ID, verified_text(name))
-
-async def announce_join_after_delay(context: ContextTypes.DEFAULT_TYPE, name: str):
-    await asyncio.sleep(JOIN_DELAY_SECONDS)
-    name = (name or "").strip()
-    if not name:
-        return
-
-    if await db_is_used(name):
-        return
-
-    await send_text(context.bot, CHAT_ID, f"{name} joined ✅")
-    await db_mark_used(name)
-
-async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.new_chat_members:
-        return
-    if not update.effective_chat or (CHAT_ID is not None and update.effective_chat.id != CHAT_ID):
-        return
-
-    await db_track_chat_message_id(update.message.message_id)
-
-    for member in update.message.new_chat_members:
-        name = (member.full_name or "").strip()
-        if name:
-            safe_create_task(announce_join_after_delay(context, name), f"announce_join_after_delay({name})")
-
-    if ENABLE_VERIFY:
-        await send_photo(context.bot, CHAT_ID, PHOTO_PATH, WELCOME_TEXT, build_keyboard_
+            cha
