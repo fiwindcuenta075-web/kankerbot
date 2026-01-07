@@ -1,13 +1,6 @@
-def main():
+async def amain():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN ontbreekt. Zet BOT_TOKEN in je environment variables.")
-
-    # ✅ FIX voor Python 3.14+: zorg dat er een event loop bestaat in MainThread
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
 
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
@@ -20,4 +13,18 @@ def main():
     app.add_handler(CallbackQueryHandler(on_verify, pattern="^verify$"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
 
-    app.run_polling(drop_pending_updates=True)
+    # ✅ Start app + polling zonder run_polling (fix voor Python 3.14 event loop issue)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+
+    # blijf runnen
+    await asyncio.Event().wait()
+
+
+def main():
+    asyncio.run(amain())
+
+
+if __name__ == "__main__":
+    main()
