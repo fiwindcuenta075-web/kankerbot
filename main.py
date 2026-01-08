@@ -60,7 +60,7 @@ ENABLE_CLEANUP = os.getenv("ENABLE_CLEANUP", "1") == "1"
 
 # ===== pinned caption loop =====
 ENABLE_PINNED_TEXT = os.getenv("ENABLE_PINNED_TEXT", "1") == "1"
-PINNED_TEXT_SECONDS = int(os.getenv("PINNED_TEXT_SECONDS", "180"))  # test. normaal: 10*60*60 of 24*60*60
+PINNED_TEXT_SECONDS = int(os.getenv("PINNED_TEXT_SECONDS", "20"))  # test. normaal: 10*60*60 of 24*60*60
 PINNED_BANNER_PATH = os.getenv("PINNED_BANNER_PATH", "IMG_1211.jpg")
 
 # ===== Telegram circuit breaker =====
@@ -122,9 +122,8 @@ def build_keyboard():
 
 
 def build_share_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 Delen", url=SHARE_URL_PINNED)],
-    ])
+    # ✅ GEEN knop meer onder "Pareltjes – Community & Handel"
+    return None
 
 
 def unlocked_text(name: str) -> str:
@@ -289,7 +288,6 @@ async def db_track_bot_message_id(message_id: int):
 
 
 # ================== TELEGRAM SEND ==================
-# ✅ FIX: accepteer elke Exception (soms komt delete-not-found binnen als NetworkError)
 def _is_delete_not_found(e: Exception) -> bool:
     msg = (str(e) or "").lower()
     return "message to delete not found" in msg or "message can't be deleted" in msg
@@ -303,7 +301,6 @@ def _throttled_pause_log(what: str, msg: str):
         logging.warning(msg)
 
 
-# ===== Sentinel for delete-not-found success =====
 _DELETE_SKIPPED_OK = object()
 
 
@@ -328,7 +325,6 @@ async def safe_send(coro_factory, what: str, max_retries: int = 5):
             await asyncio.sleep(sleep_s)
 
         except (TimedOut, NetworkError) as e:
-            # ✅ FIX: delete "not found" is normaal -> NIET retryen / NIET circuit-breaken
             if "delete_message" in what and _is_delete_not_found(e):
                 logging.info("%s: delete skipped (not found/already deleted).", what)
                 return _DELETE_SKIPPED_OK
@@ -424,7 +420,6 @@ async def send_photo(
     return msg
 
 
-# ================== HANDLERS ==================
 async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer(
         "Can’t acces the group, because unfortunately you haven’t shared the group 3 times yet.",
@@ -432,7 +427,6 @@ async def on_open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ✅ delete the "pinned a photo" service message immediately
 async def on_pinned_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or update.effective_chat.id != CHAT_ID:
         return
@@ -472,7 +466,6 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
             safe_create_task(announce_join_after_delay(context, name), "announce_join_after_delay")
 
 
-# ================== LOOPS ==================
 async def reset_loop():
     while True:
         now = datetime.now(TZ)
@@ -504,7 +497,6 @@ async def cleanup_all_bot_messages_loop(app: Application):
                 lambda: app.bot.delete_message(chat_id=CHAT_ID, message_id=mid),
                 "delete_message(cleanup_all)"
             )
-            # _DELETE_SKIPPED_OK counts as success, so don't keep it
             if ok is None:
                 kept.append(mid)
 
@@ -527,7 +519,7 @@ async def pinned_caption_loop(app: Application):
             CHAT_ID,
             PINNED_BANNER_PATH,
             CAPTION,
-            build_share_keyboard(),
+            build_share_keyboard(),  # <- nu None, dus geen knop
             parse_mode="HTML",
             has_spoiler=False,
         )
@@ -568,7 +560,7 @@ async def daily_post_loop(app: Application):
 
         if msg:
             last_msg_id = msg.message_id
-            # ✅ DAILY WORDT NIET GEPINNED (alleen Pareltjes caption loop)
+            # daily wordt NIET gepinned
 
         await asyncio.sleep(DAILY_SECONDS)
 
@@ -659,7 +651,6 @@ async def activity_loop(app: Application):
         await asyncio.sleep(ACTIVITY_SECONDS)
 
 
-# ================== INIT ==================
 async def post_init(app: Application):
     me = await app.bot.get_me()
     logging.info("Bot started: @%s", me.username)
@@ -706,8 +697,6 @@ def main():
 
     app.add_handler(CallbackQueryHandler(on_open_group, pattern="^open_group$"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
-
-    # ✅ delete "pinned a photo" service messages
     app.add_handler(MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, on_pinned_service_message))
 
     app.run_polling(drop_pending_updates=True)
