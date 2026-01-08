@@ -98,8 +98,7 @@ CAPTION = """
 <b>Gateway (link):</b> 🔥
 https://t.me/pareltjesGW
 
-🔔 <b>Tip:</b> Deel naar 3 mensen voor instant accept 0/3 ✅👇
-""".strip()
+)
 
 SHARE_TEXT = (
     "✨ Pareltjes – Community & Handel ✨\n\n"
