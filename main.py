@@ -92,13 +92,13 @@ SHARE_URL = (
 GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/+D8FCvP2JTYVlZTZk")
 GATEWAY_LINK = os.getenv("GATEWAY_LINK", "https://t.me/pareltjesGW")
 
+# ✅ AANGEPAST: tip-regel verwijderd
 CAPTION = """
 ✨ <b>Pareltjes – Community & Handel</b> ✨
 
 <b>Gateway (link):</b> 🔥
 https://t.me/pareltjesGW
-
-)
+""".strip()
 
 SHARE_TEXT = (
     "✨ Pareltjes – Community & Handel ✨\n\n"
@@ -518,7 +518,7 @@ async def pinned_caption_loop(app: Application):
             CHAT_ID,
             PINNED_BANNER_PATH,
             CAPTION,
-            build_share_keyboard(),  # <- nu None, dus geen knop
+            build_share_keyboard(),
             parse_mode="HTML",
             has_spoiler=False,
         )
@@ -559,7 +559,6 @@ async def daily_post_loop(app: Application):
 
         if msg:
             last_msg_id = msg.message_id
-            # daily wordt NIET gepinned
 
         await asyncio.sleep(DAILY_SECONDS)
 
