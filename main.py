@@ -83,16 +83,13 @@ WELCOME_TEXT = (
     "REDDIT.COM or X.COM"
 )
 
-SHARE_URL = (
-    "https://t.me/share/url?url=%20all%20exclusive%E2%80%94content%20@THPLUS18HUB"
-    "https%3A%2F%2Ft.me%2F%2BAiDsi2LccXJmMjlh"
-)
+# ✅ AANGEPAST: 0/3 share deelt alleen deze tekst
+SHARE_URL = "https://t.me/share/url?url=&text=all%20exclusive%E2%80%94content%20%40THPLUS18HUB"
 
 # pinned/share config
 GROUP_LINK = os.getenv("GROUP_LINK", "https://t.me/+D8FCvP2JTYVlZTZk")
 GATEWAY_LINK = os.getenv("GATEWAY_LINK", "https://t.me/pareltjesGW")
 
-# ✅ AANGEPAST: tip-regel verwijderd
 CAPTION = """
 ✨ <b>Pareltjes – Community & Handel</b> ✨
 
@@ -518,7 +515,7 @@ async def pinned_caption_loop(app: Application):
             CHAT_ID,
             PINNED_BANNER_PATH,
             CAPTION,
-            build_share_keyboard(),
+            None,
             parse_mode="HTML",
             has_spoiler=False,
         )
